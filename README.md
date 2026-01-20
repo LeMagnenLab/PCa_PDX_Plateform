@@ -9,3 +9,6 @@
 - Processed data can be found on the Zenodo repository linked to this study: 
 
 - Raw data are protected regarding the ethics signed by the patient and will be deposited online in the EGA repository.
+
+Author: Romuald Parmentier
+Contact: romuald.parmetnier@usb.ch
