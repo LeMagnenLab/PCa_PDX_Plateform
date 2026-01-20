@@ -1,0 +1,359 @@
+---
+title: "Untitled"
+author: "Romuald Parmentier"
+date: "2025-10-27"
+output: html_document
+---
+
+```{r Set up the environement}
+
+### Load Required Libraries
+library(SingleCellExperiment)
+library(scater)
+library(scran)
+library(scuttle)
+library(scDblFinder)
+library(AnnotationHub)
+library(dplyr)
+library(ComplexHeatmap) # Needed for UpsetPlot
+library(circlize)
+library(grid)
+library(Matrix)
+
+### Source Custom Functions
+source("/scicore/home/wykopa75/GROUP/rparmentier/sc_RNAseq/Projects/Prostate/Xenograft_Models/Xenograft_Models_Custom_Functions.R")
+source("/scicore/home/wykopa75/GROUP/rparmentier/sc_RNAseq/Projects/Prostate/Xenograft_Models/Xenograft_Models_Color_Palettes.R")
+
+### Define Output   Path
+out_path <- create_exp_folder(
+  organ = "Prostate",
+  project = "Xenograft_Models",
+  samples_ID = "CRPC_Dong_2020",
+  exp = "1_quality_controls"
+)
+
+```
+
+# Prepare the data
+
+```{r Load Supplementary file (expression tables)}
+
+exprs_table_list = list.files(
+  path = "/scicore/home/wykopa75/GROUP/rparmentier/sc_RNAseq/Projects/Sequencing_Data/Pre_Processed_Data/Dong_2020",
+  pattern = "GSM",
+  full.names = T)
+
+# Extract patient names
+names <- as.character(
+  sapply(
+    exprs_table_list,
+    function(file) {
+      str_extract(
+        string = basename(file),
+        pattern = "^GSM[0-9]+_[^_]+"
+      )
+    }
+  )
+)
+
+# ---- Read expression tables and make sce objects ----
+sce_obj_list = list()
+
+for (i in seq_along(exprs_table_list)) {
+  
+  expr_table_path <- exprs_table_list[i]
+  
+  # Read
+  expr_table <- read.delim(expr_table_path, check.names = FALSE)  # keep barcodes intact
+  
+  # IDs
+  gene_id <- expr_table$Gene_ID
+  symbol  <- expr_table$Symbol
+  
+  # Counts (all col but "Gene_ID" and "Symbol")
+  count_df <- expr_table[, setdiff(names(expr_table), c("Gene_ID","Symbol")), drop = FALSE]
+  
+  # Convert NA to 0
+  if (anyNA(count_df)) {
+    warning("NA values found in counts; converting to 0.")
+    count_df[is.na(count_df)] <- 0
+  }
+  
+  # Convert to matrix
+  count_m <- as.matrix(count_df)
+  
+  # Aggregate duplicated symbols
+  agg_m <- rowsum(count_m, group = symbol, reorder = FALSE)
+  storage.mode(agg_m) <- "integer"
+  
+  ## Map Symbols -> concatenated Gene_IDs
+  id_map <- tapply(gene_id, symbol, function(x) paste(unique(x), collapse = ";"))
+  id_map <- id_map[rownames(agg_m)]
+  
+  ## Sparse counts
+  counts <- as(agg_m, "dgCMatrix")
+  
+  ## rowData
+  rd <- DataFrame(
+    Symbol   = rownames(counts),
+    Gene_ID  = unname(id_map),
+    row.names = rownames(counts)
+  )
+  
+  ## colData: sample label = everything before first "_" in the *basename* of the file
+  bn <- basename(expr_table_path)
+  sample_id <- str_extract(bn, "^[^_]+")
+  
+  cd <- DataFrame(
+    sample = rep(sample_id, ncol(counts)),
+    row.names = colnames(counts)
+  )
+  
+  ## Build SCE
+  sce_obj <- SingleCellExperiment(
+    assays  = list(counts = counts),
+    rowData = rd,
+    colData = cd
+  )
+  
+  ## Store
+  sce_obj_list[[i]] <- sce_obj
+  
+}
+
+names(sce_obj_list) = names
+
+```
+
+Rational behind union of gene instead of intersection is that a missing gene already behaves as a line of 0
+
+```{r Build a Symbol to Gene ref table and extract union of all genes}
+
+## ---- Build a master Symbol -> Gene_ID map from all SCEs ----
+
+# Collect all (Symbol, Gene_ID) pairs from every SCE
+rd_all <- do.call(
+  rbind,
+  lapply(sce_obj_list, function(sce) {
+    df <- as.data.frame(rowData(sce)[, c("Symbol", "Gene_ID")])
+    # be safe with types
+    df$Symbol  <- as.character(df$Symbol)
+    df$Gene_ID <- as.character(df$Gene_ID)
+    df
+  })
+)
+
+# For each Symbol, collapse unique Gene_IDs 
+collapse_ids <- function(x) {
+  x <- na.omit(x)
+  if (!length(x)) return(NA_character_)
+  ux <- unique(unlist(strsplit(paste(x, collapse = ";"), ";", fixed = TRUE)))
+  ux <- ux[nzchar(ux)]
+  if (!length(ux)) NA_character_ else paste(ux, collapse = ";")
+}
+
+comb <- tapply(rd_all$Gene_ID, rd_all$Symbol, collapse_ids)
+
+# Create master rowData (DataFrame) and ensure it covers all symbols 
+#    Use union of symbols as the canonical gene set
+all_genes <- Reduce(union, lapply(sce_obj_list, rownames))
+
+master_rd <- DataFrame(
+  Symbol   = names(comb),
+  Gene_ID  = unname(comb),
+  row.names = names(comb)
+)
+
+# Add any symbols that were never seen in any SCE's rowData (if any)
+miss_in_master <- setdiff(all_genes, rownames(master_rd))
+if (length(miss_in_master)) {
+  master_rd <- rbind(
+    master_rd,
+    DataFrame(Symbol = miss_in_master, Gene_ID = NA_character_, row.names = miss_in_master)
+  )
+}
+# Reorder to canonical order
+master_rd <- master_rd[all_genes, , drop = FALSE]
+
+
+## ---- Pad each SCE to the union using the master mapping ----
+pad_to_union <- function(sce, all_genes, master_rd) {
+  
+  stopifnot(identical(rownames(master_rd), all_genes))
+  
+  # Any symbols missing in this SCE?
+  miss <- setdiff(all_genes, rownames(sce))
+  
+  # Counts: append zero rows for missing, then reorder
+  cts <- counts(sce)
+  if (length(miss)) {
+    zero_block <- Matrix::Matrix(
+      0L, nrow = length(miss), ncol = ncol(sce), sparse = TRUE,
+      dimnames = list(miss, colnames(sce))
+    )
+    cts <- rbind(cts, zero_block)
+  }
+  cts <- cts[all_genes, , drop = FALSE]
+  
+  # Row metadata: take directly from the master map
+  # (optional) warn if existing Gene_ID disagrees with master for overlapping symbols
+  overlap <- intersect(rownames(sce), all_genes)
+  if (length(overlap)) {
+    gi_cur <- as.character(rowData(sce)[overlap, "Gene_ID"])
+    gi_ref <- as.character(master_rd[overlap, "Gene_ID"])
+    mismatch <- overlap[which( (is.na(gi_cur) != is.na(gi_ref)) |
+                                 (!is.na(gi_cur) & !is.na(gi_ref) & gi_cur != gi_ref) )]
+    if (length(mismatch)) {
+      warning(sprintf("Gene_ID mismatch for %d symbols; using master mapping. e.g.: %s",
+                      length(mismatch),
+                      paste(utils::head(mismatch, 3), collapse = ", ")))
+    }
+  }
+  
+  SingleCellExperiment::SingleCellExperiment(
+    assays  = list(counts = cts),
+    rowData = master_rd,
+    colData = colData(sce)
+  )
+}
+
+## Apply to all SCEs
+sce_obj_list <- lapply(sce_obj_list, pad_to_union, all_genes = all_genes, master_rd = master_rd)
+
+```
+
+# Per-cell metrics  
+
+I don't know if the object the authors shared was pre-filtred or not. 
+So I decided to flag the cells, pplying the same QC tresholds than the paper : 
+
+- No doublet detection, genes < 500 or > 7000, mitochondrial genes > 10%
+```{r Calcualte per cell metrics and quality flag}
+
+# Load annotation
+EnsDb.Hsapiens.v104 <- AnnotationHub(localHub = TRUE)[["AH95744"]]
+
+# Summary tables
+qc_metrics_all_samples <- data.frame()
+qc_metrics_hto_samples <- data.frame()
+
+# Iterate over samples
+for (sce_id in seq_along(sce_obj_list)) {
+  
+  sample_name <- names(sce_obj_list)[[sce_id]]
+  print(paste0("Computing QC for sample ", sample_name))
+  
+  sce <- sce_obj_list[[sce_id]]
+  
+  # ---------- Gene Annotation ----------
+  
+  gene_info <- as_tibble(rowData(sce)) %>%
+    dplyr::select(Gene_ID) %>%
+    mutate(
+      SYMBOL = mapIds(EnsDb.Hsapiens.v104, keys = Gene_ID, keytype = "GENEID", column = "SYMBOL", multiVals = "first"),
+      GENEBIOTYPE = mapIds(EnsDb.Hsapiens.v104, keys = Gene_ID, keytype = "GENEID", column = "GENEBIOTYPE", multiVals = "first"),
+      SEQNAME = mapIds(EnsDb.Hsapiens.v104, keys = Gene_ID, keytype = "GENEID", column = "SEQNAME", multiVals = "first")
+    )
+  
+  gene_info_filtered <- gene_info %>%
+    dplyr::filter(
+      SEQNAME %in% c(as.character(1:22), "MT", "X", "Y"),
+      GENEBIOTYPE %in% c("protein_coding", "lncRNA"),
+      !is.na(SYMBOL) & SYMBOL != ""
+    ) %>%
+    distinct(SYMBOL, .keep_all = TRUE)
+  
+  # --- Alignment step: keep SCE order and match metadata to it ---
+  m <- match(rownames(sce), gene_info_filtered$SYMBOL)  # length == nrow(sce)
+  keep <- !is.na(m)
+  
+  # Subset SCE in its own order
+  sce_sub <- sce[keep, ]
+  
+  # Pull the *matched rows* of gene_info_filtered IN THE SAME ORDER as sce_sub
+  gi_aligned <- gene_info_filtered[m[keep], , drop = FALSE]
+  
+  # Add rowData with identical row alignment
+  rowData(sce_sub) <- DataFrame(gi_aligned)
+  
+  # Sanity check: rownames(counts) == rowData$SYMBOL
+  stopifnot(identical(rownames(sce_sub), unname(rowData(sce_sub)$SYMBOL)))
+  
+  # ---------- QC Metrics ----------
+  n_cells_original <- ncol(sce_sub)
+  print("QC metrics: UMI, gene, mito")
+  
+  sce_sub <- addPerCellQCMetrics(
+    x = sce_sub,
+    subsets = list(mitochondrial_reads = grep("MT", rowData(sce_sub)$SEQNAME))
+  )
+  
+  # Hard-Thresholds
+  
+  sce_sub$gene_discarded <- sce_sub$detected < 500 | sce_sub$detected > 7000
+  sce_sub$mito_discarded <- sce_sub$subsets_mitochondrial_reads_percent > 10
+  
+  
+  # ---------- Global discard flag ----------
+  sce_sub$qc_discarded <- with(
+    colData(sce_sub),
+    gene_discarded | mito_discarded 
+  )
+  
+  # ---------- All-sample summary ----------
+  df_row <- data.frame(
+    Library_ID = sample_name,
+    before_QC = ncol(sce_sub),
+    Out_Genes = sum(sce_sub$gene_discarded),
+    High_Mito = sum(sce_sub$mito_discarded),
+    Cells_discarded_total = sum(sce_sub$qc_discarded),
+    Cells_Retained = ncol(sce_sub) - sum(sce_sub$qc_discarded)
+  )
+  
+  qc_metrics_all_samples <- bind_rows(qc_metrics_all_samples, df_row)
+  
+  # ---- Get all mitochondirala and all ribosomal genes ---
+  mito_ribo_genes <- grepl(x = rownames(sce_sub), pattern ="^(MRP|MRPL|MRPS|RPL|RPS|MT-)")
+  sce_sub = sce_sub[!mito_ribo_genes,]
+  
+  # ---------- Save updated object ----------
+  sce_obj_list[[sample_name]] <- sce_sub
+}
+
+# ---------- Export summaries ----------
+write.csv(qc_metrics_all_samples, file = paste0(out_path, "qc_metrics_all_samples.csv"), row.names = FALSE)
+
+# ---------- Export flagged list of sce ----------
+saveRDS(object = sce_obj_list, file = paste0(out_path, "sce_obj_list_flag_qc.rds"))
+
+```
+
+Article: mean of 2419 genes per cell (mitochondiral and ribosomal genes removed)
+Here: mean of 2431 (mitochondiral and ribosomal genes removed + protein coding + lnRNA genes only kept)
+
+```{r Average number of genes per cell}
+
+# number of genes detected (nonzero) per cell
+ngenes_per_cell <- lapply(sce_obj_list, 
+                          function(sce){
+                            count = colSums(counts(sce) > 0)
+                            return(count)
+                          }
+)
+
+# Summary of the whole cohort
+summary(unlist(ngenes_per_cell))
+
+```
+
+# Export list of sce
+
+```{r}
+
+saveRDS(
+  object = sce_obj_list,
+  file = paste0(out_path, time_stamp(), "sce_obj_list_qc_flagged.rds"))
+
+```
+
+

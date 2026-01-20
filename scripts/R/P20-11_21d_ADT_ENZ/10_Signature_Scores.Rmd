@@ -1,0 +1,646 @@
+---
+title: "10.P20-11 ADT+ENZ treated (21 Days):: Signature scores"
+author: "Romuald Parmentier"
+date: "2025-04-14"
+output: html_document
+---
+
+```{r Prepare environment, message = F}
+
+#Libraries
+library(SingleCellExperiment)
+library(Seurat)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(ggbeeswarm)
+library(gridExtra)
+library(scater)
+library(org.Hs.eg.db)
+library(ComplexHeatmap)
+library(ggpubr)
+library(AnnotationHub)
+library(msigdbr)
+library(clusterProfiler)
+library(stringr)
+library(rstatix)
+
+# Functions and palettes
+source("/scicore/home/wykopa75/GROUP/rparmentier/sc_RNAseq/Projects/Prostate/Xenograft_Models/Xenograft_Models_Custom_Functions.R")
+source("/scicore/home/wykopa75/GROUP/rparmentier/sc_RNAseq/Projects/Prostate/Xenograft_Models/Xenograft_Models_Color_Palettes.R")
+
+# Create output path
+out_path = create_exp_folder(
+  organ = "Prostate" ,
+  project = "Xenograft_Models",
+  samples_ID = "P20-11_21d_ADT_ENZ",
+  exp = "10_Signature_Scores"
+)
+
+```
+
+# Prepare the data
+
+```{r Load sce object after differential expression}
+
+file_path = get_exp_file_path(
+  organ = "Prostate" ,
+  project = "Xenograft_Models",
+  samples_ID = "P20-11_21d_ADT_ENZ",
+  prev_exp = "7_Clustering",
+  pattern = "sce_obj_dim_clustered.rds")
+
+sce_obj = readRDS(file_path)
+
+```
+
+```{r Transform sce to Seurat object}
+
+seurat_obj = as.Seurat(
+  x = sce_obj, 
+  counts = "counts", 
+  data = "logcounts"
+)
+
+# Set the originalexp (aka "RNA" as the default assay)
+DefaultAssay(seurat_obj) = "originalexp"
+
+# Adds scale.data slot
+seurat_obj = ScaleData(seurat_obj)
+
+```
+
+# Prepare gene set list to calculate signature score onto
+---------------------------------------------------------
+
+## Load gene set fron MSigDB
+
+```{r Format collection of enriched pathways and gse results}
+
+HALLMARK = read.gmt("/scicore/home/wykopa75/GROUP/rparmentier/sc_RNAseq/Projects/Sequencing_Data/Gene_sets/MSigDB_HALLMARKS_hs_v2023_2.gmt")
+GOBP = read.gmt("/scicore/home/wykopa75/GROUP/rparmentier/sc_RNAseq/Projects/Sequencing_Data/Gene_sets/MSigDB_C5_GO_Biological_Process.gmt")
+GOMF = read.gmt("/scicore/home/wykopa75/GROUP/rparmentier/sc_RNAseq/Projects/Sequencing_Data/Gene_sets/MSigDB_C5_GO_Molecular_Function.gmt")
+C2 = read.gmt("/scicore/home/wykopa75/GROUP/rparmentier/sc_RNAseq/Projects/Sequencing_Data/Gene_sets/MSigDB_C2_Curated_Gensets.gmt")
+
+
+list_collection = list(
+  "C2" = C2, #BIOCARTA, KEGG_MEDICUS, PID, REACTOME, WIKIPATHWAY, KEGG_LEGACY
+  "HALLMARK" = HALLMARK,
+  "GOBP" = GOBP,
+  "GOMF" = GOMF)
+
+# Make a single df out of all gene sets fron differnet collecitons
+gene_set_collection_df = data.table::rbindlist(list_collection)
+
+```
+
+## Pick targetted signature to test
+
+```{r Pattern matching to select pathway of interst }
+
+targetted_terms <- gene_set_collection_df %>% 
+  filter(str_detect(term, pattern = "ANDROGEN|HALLMARK")) %>% 
+  pull(term)
+
+targetted_terms = unique(as.character(targetted_terms))
+
+```
+
+## Custom signature
+
+```{r Create signature with custom gene list}
+
+custom_gene_sets_df = tibble()
+
+# ALIMONTI senescence signature score
+# (https://www.nature.com/articles/s41467-022-29824-1#Sec37)
+############################################################
+
+# Check presence and alias if needed
+allias = sapply(c("P16", "P15", "P19", "P21", "P27" , "PAI-1"), function(gene){
+  check_aliase(
+    sce = sce_obj, 
+    gene = gene )
+}
+)
+
+gene_set_df = tibble(
+  term = "ALIMONTI_SENESCENCE",
+  gene = allias
+)
+
+# Add the custom pahway to a df
+custom_gene_sets_df = bind_rows(custom_gene_sets_df, gene_set_df)
+
+# Cluster 5 markers
+###################
+
+file_path = get_exp_file_path(
+  organ = "Prostate" ,
+  project = "Xenograft_Models",
+  samples_ID = "P20-11_21d_ADT",
+  prev_exp = "8_Differential_Expression",
+  pattern = "DE_Table_All_Clusters.csv")
+
+all_cluster_DE_genes = read.csv2(file_path)
+
+# Extract genes
+cluster_5_genes = all_cluster_DE_genes %>% 
+  filter(cluster == 5 & avg_log2FC > 3 & pct.1 > 0.7) %>%
+  pull(gene) # 22 genes
+
+# Check presence and alias if needed
+allias = sapply(cluster_5_genes, function(gene){check_aliase(sce = sce_obj, gene = gene)})
+
+# Add tern to the custom_term table
+gene_set_df = tibble(
+  term = "CLUSTER_5_ADT",
+  gene = allias
+)
+
+# Add the custom pahway to a df
+custom_gene_sets_df = bind_rows(custom_gene_sets_df, gene_set_df)
+
+```
+
+```{r Load NE gene sets retrieved from litterature}
+
+custom_gene_sets_NE = read.csv2(
+  "/scicore/home/wykopa75/GROUP/rparmentier/sc_RNAseq/Projects/Prostate/Xenograft_Models/Xenograft_Custom_Gene_Sets.csv",
+  header = T)
+
+custom_gene_sets_df = bind_rows(custom_gene_sets_df, custom_gene_sets_NE)
+
+```
+
+## Assemble all gene set to be tested
+
+```{r Assemble gene sets of choice to test signature}
+
+# Gater all selected gene terms from MsigDB
+MSigDB_terms = c(targetted_terms)
+
+# Select gene set to score withing the MsigDB collection df
+gene_sets_to_score_df = gene_set_collection_df %>%
+  filter(term %in% MSigDB_terms)
+
+# Add custom pathway to the term to score df
+gene_sets_to_score_df = bind_rows(gene_sets_to_score_df, custom_gene_sets_df)
+
+print(paste0(length(unique(gene_sets_to_score_df$term)), " pathways to score"))
+
+```
+
+# Add signature to sce
+-----------------------
+
+```{r Add signature score to sce object }
+
+terms_col_idx = str_detect(string = colnames(colData(sce_obj)), pattern = "score")
+already_score_terms = str_remove(string = colnames(colData(sce_obj))[terms_col_idx],pattern = "_score")
+terms_to_score_names = setdiff(unique(gene_sets_to_score_df$term), already_score_terms )
+
+# Select only gene sets that havn't been scored yet
+gene_sets_to_score_df = gene_sets_to_score_df %>%
+  filter(term %in% terms_to_score_names )
+
+for(pathway in unique(gene_sets_to_score_df$term)){
+  
+  print(paste0("Enrich plot for pathway: ", pathway))
+  
+  # Select genes on which calculating the signature score
+  genes_of_interest <- gene_sets_to_score_df %>% filter(term == pathway)
+  genes_of_interest = as.vector(genes_of_interest$gene)
+  
+  # Calculate signature score and add it to seurat object as an alternative assays (signature only + signature genes only)
+  seurat_comb = calculate_signature_score(
+    assay_name = "originalexp",
+    seurat_object = seurat_comb, 
+    signature_name = pathway, 
+    signature_genes = genes_of_interest
+  )
+  
+  # Transfer the signature score from seurat to sce (score in colData, genes of the signature marked in the rowData)
+  sce_obj = add_signature_score_to_sce(
+    sce_object = sce_obj,
+    seurat_object = seurat_comb,
+    signature_name = pathway,
+    seurat_assay = paste0(pathway, "_score_only"),
+    signature_genes = genes_of_interest
+  )
+  
+}
+
+```
+
+```{r Export scored sce object}
+
+saveRDS(
+  object = sce_obj,
+  file = paste0(out_path, time_stamp(),"sce_obj_scored.rds")
+)
+
+```
+
+# Visualize it
+--------------
+
+```{r Reload sce object if needed}
+
+file_path = get_exp_file_path(
+  organ = "Prostate" ,
+  project = "Xenograft_Models",
+  samples_ID = "P20-11_21d_ADT_ENZ",
+  prev_exp = "10_Signature_Scores",
+  pattern = "sce_obj_scored.rds")
+
+sce_obj = readRDS(file_path)
+
+```
+
+```{r Export all metadata into a dataframe}
+
+md = colData(sce_obj)
+md = as_tibble(md)
+
+md <- md %>%
+  mutate(walktrap_clust = paste0("cluster_", walktrap_75)) %>%
+  mutate(walktrap_clust = factor(walktrap_clust, levels = c(
+    "cluster_2", "cluster_5", "cluster_6", "cluster_7", "cluster_1", "cluster_3", "cluster_4", "cluster_8"
+  )))
+
+```
+
+### Violin plot 
+
+```{r Violin plots split by treatment}
+
+md$walktrap_75
+gene_signature_scores = colnames(md)[which(grepl(x = colnames(md), pattern = "score"))]
+pathway_id = 1
+
+plot_list = list()
+
+for(gene_signature in gene_signature_scores){
+  
+  #######
+  ## Stat test
+  ######
+  
+  # Build formula dynamically
+  fml <- as.formula(paste(gene_signature, "~ walktrap_clust"))
+  kruskal.test(formula = fml, data = md)
+  
+  dunn_results <- md %>%
+    dunn_test(formula = fml, p.adjust.method = "bonferroni") %>%
+    filter(group1 == "cluster_8" | group2 == "cluster_8")
+  
+  # Calculate y position of stars
+  dunn_results <- dunn_results %>%
+    rowwise() %>%
+    mutate(
+      y.position = 0.05 + max(md[[gene_signature]][md$walktrap_clust == group1 | md$walktrap_clust == group2]),
+      cluster_ref = if_else(group1 == "cluster_8", group2, group1),
+      xmin = cluster_ref,
+      xmax = cluster_ref
+    ) %>%
+    ungroup()
+  
+  
+  
+  
+  ###############
+  ### Draw plot
+  ############
+  
+  plot <- ggplot(md) +
+    geom_violin(
+      aes(x = walktrap_clust, y = .data[[gene_signature]], fill = walktrap_clust),
+      alpha = 0.8,
+      position = position_dodge(width = 0.8),
+      scale = "width"
+    ) +
+    geom_boxplot(
+      aes(x = walktrap_clust, y = .data[[gene_signature]], fill = walktrap_clust),
+      width = 0.1,
+      position = position_dodge(width = 0.8),
+      alpha = 0.5
+    ) +
+    stat_pvalue_manual(
+      dunn_results,
+      label = "p.adj.signif",
+      y.position = "y.position",
+      tip.length = 0.01,
+      size = 3
+    ) +
+    geom_hline(
+      yintercept = 0,
+      linetype = "dotted",
+      color = "black",
+      size = 0.8
+    ) +
+    scale_fill_manual(values = pal_walktrap_cluster_chr) +
+    labs(
+      title = paste0("Signature score: ", gene_signature),
+      x = "Cluster",
+      y = "Signature score",
+      fill = "Cluster"
+    ) +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 6),
+      strip.text = element_text(size = 12),
+      strip.background = element_rect(fill = "grey90", color = "grey40", linewidth = 0.5),
+      panel.background = element_rect(fill = "transparent", color = NA),
+      plot.background = element_rect(fill = "transparent", color = NA),
+      panel.grid.major = element_line(color = "grey90"),
+      panel.grid.minor = element_line(color = "grey95"),
+      panel.border = element_rect(color = "grey60", fill = NA, linewidth = 0.5)
+    )
+  
+  plot_list[[pathway_id]] = plot
+  
+  pathway_id = pathway_id + 1
+  
+}
+
+multiple_page_layout <- gridExtra::marrangeGrob(
+  grobs = plot_list, 
+  nrow = 1, ncol = 1)
+
+ggsave(
+  plot = multiple_page_layout,
+  filename = paste0(out_path,time_stamp(),"plot_Violins_Walktrap_Clusters.pdf"),
+  device = "pdf",
+  width = 12,
+  height = 8)
+
+```
+
+### Heatmap for the custom (litterature) NE gene sets 
+
+```{r log2UMI matrix}
+
+plot_list = list()
+plot_id = 1
+
+for(signature_name in unique(custom_gene_sets_NE$term)){
+  
+  genes_on_Heatmap = custom_gene_sets_NE %>% 
+    filter(term == signature_name) %>%
+    pull(gene)
+  
+  # Find missing genes and try to find aliases
+  ############################################
+  missing_genes = setdiff(x = genes_on_Heatmap, y = rownames(sce_obj))
+  allias = sapply(missing_genes, function(gene){check_aliase(sce = sce_obj, gene = gene)})
+  
+  if (length(allias)!=0){
+    genes_on_Heatmap = c(genes_on_Heatmap, allias)
+    genes_on_Heatmap = intersect(rownames(sce_obj), genes_on_Heatmap)
+  }else{}
+  
+  # Finale gene list that will appear on the heatmap
+  genes_on_Heatmap = unique(genes_on_Heatmap)
+  
+  # Make a sce object with hte tested genes only
+  sce_obj_signature = sce_obj[genes_on_Heatmap, ]
+  sce_obj_signature$walktrap_75 = factor(sce_obj_signature$walktrap_75, levels = c("2","5","6","7","1","3","4","8"))
+
+  # Make a matrix
+  ###############
+  
+  # Extract the matrix with logcounts of selected genes only
+  sce_obj_signature_mtx = as.matrix(logcounts(sce_obj_signature))
+  
+  # Log2UMI heatmap
+  ##################
+  
+  heatmap_anno = HeatmapAnnotation(
+    Clusters = sce_obj_signature$walktrap_75,
+    Condition = factor(sce_obj_signature$Multiplexing_Condition, levels = unique(sce_obj_signature$Multiplexing_Condition)), # Has to be a factor
+    col = list(
+      Condition = pal.treatment, 
+      Clusters = pal_walktrap_cluster))
+  
+  
+  row.fontsize <- ifelse(length(genes_on_Heatmap) >= 150, 4,
+                         ifelse(length(genes_on_Heatmap) >= 100, 5, 
+                                ifelse(length(genes_on_Heatmap) >= 50, 6,
+                                       7)))
+  
+  plot = Heatmap(name = "log2(UMI)", 
+                 top_annotation = heatmap_anno,
+                 matrix = sce_obj_signature_mtx,
+                 cluster_rows = T,
+                 cluster_columns = T,
+                 cluster_column_slices = F,# If TRUE it will try to cluster cells
+                 column_split = sce_obj_signature$walktrap_75,  # Will seperate clusters
+                 show_column_dend = F, # If a dend has been provided in cluster_columns then it will use this one, otherwise, makes a new one.
+                 show_column_names = F, # This will make cell names appear in this case (should remain F)
+                 show_row_dend = F,
+                 column_title_rot = 0,
+                 use_raster = TRUE,
+                 col = c("lightgrey", paletteer_c("viridis::magma", 30,direction = -1 )), # or col = c("grey", rev(paletteer_c("viridis::inferno", 30))),
+                 row_names_gp = grid::gpar(fontsize = row.fontsize),
+                 width = unit(7, "inch"),  # reduce width for padding
+                 height = unit(7, "inch"),  # reduce width for padding
+                 heatmap_legend_param = list(
+                   direction = "horizontal",
+                   title_position = "topcenter",
+                   legend_direction = "horizontal",
+                   legend_width = unit(4, "cm")
+                 )
+  )
+  
+  plot_list[[signature_name]] = plot
+  
+  plot_id = plot_id + 1
+  
+}
+
+
+##### 
+# Draw the heatmap
+#####
+
+pdf(file = paste0(out_path, time_stamp(), "plot_Heatmap_custom_gene_set_log2UMI_Walktrap_clusters.pdf"),
+    width = 9, height = 9.5)
+
+for (signature_name in names(plot_list)) {
+  
+  draw(
+    object = plot_list[[signature_name]],
+    heatmap_legend_side = "bottom",
+    annotation_legend_side = "bottom",
+    column_title=signature_name,
+    column_title_gp=grid::gpar(fontsize=16),
+    merge_legend = TRUE
+  )
+  
+}
+
+dev.off()
+
+
+```
+
+```{r Z-score matrix}
+
+plot_list = list()
+plot_id = 1
+
+for(signature_name in unique(custom_gene_sets_NE$term)){
+  
+  genes_on_Heatmap = custom_gene_sets_NE %>% 
+    filter(term == signature_name) %>%
+    pull(gene)
+  
+  # Find missing genes and try to find aliases
+  ############################################
+  
+  missing_genes = setdiff(x = genes_on_Heatmap, y = rownames(sce_obj))
+  allias = sapply(missing_genes, function(gene){check_aliase(sce = sce_obj, gene = gene)})
+  
+  if (length(allias)!=0){
+    genes_on_Heatmap = c(genes_on_Heatmap, allias)
+    genes_on_Heatmap = intersect(rownames(sce_obj), genes_on_Heatmap)
+  }else{}
+  
+  # Finale gene list that will appear on the heatmap
+  genes_on_Heatmap = unique(genes_on_Heatmap)
+  
+  # Make a sce object with hte tested genes only
+  seurat_obj_signature_scaled = seurat_obj@assays$originalexp$scale.data[genes_on_Heatmap, ]
+  
+  # Make a matrix
+  ###############
+  
+  # Extract the matrix with logcounts of selected genes only
+  seurat_obj_signature_mtx_scaled = as.matrix(seurat_obj_signature_scaled)
+  
+  # z-score heatnap
+  ##################
+  
+  heatmap_anno = HeatmapAnnotation(
+    Clusters = sce_obj_signature$walktrap_75,
+    Condition = factor(sce_obj_signature$Multiplexing_Condition, levels = unique(sce_obj_signature$Multiplexing_Condition)), # Has to be a factor
+    col = list(
+      Condition = pal.treatment, 
+      Clusters = pal_walktrap_cluster)
+  )
+  
+  
+  row.fontsize <- ifelse(length(genes_on_Heatmap) >= 150, 4,
+                         ifelse(length(genes_on_Heatmap) >= 100, 5, 
+                                ifelse(length(genes_on_Heatmap) >= 50, 6,
+                                       7)))
+  
+  
+  plot = Heatmap(name = "Z-score",
+                 top_annotation = heatmap_anno,
+                 matrix = seurat_obj_signature_mtx_scaled,
+                 cluster_rows = T,
+                 cluster_columns = T,
+                 cluster_column_slices = F,# If TRUE it will try to cluster cells
+                 column_split = sce_obj_signature$walktrap_75,  # Will seperate clusters
+                 show_column_dend = F, # If a dend has been provided in cluster_columns then it will use this one, otherwise, makes a new one.
+                 show_column_names = F, # This will make cell names appear in this case (should remain F)
+                 show_row_dend = F,
+                 column_title_rot = 0,
+                 use_raster = TRUE,
+                 col_fun <- circlize::colorRamp2(
+                   breaks = c(-3, 0, 3),  # ou plus symétrique : c(-3, 0, 3) selon la distribution
+                   colors = c("darkblue", "white", "darkred")),
+                 row_names_gp = grid::gpar(fontsize = row.fontsize),
+                 width = unit(7, "inch"),  # reduce width for padding
+                 height = unit(7, "inch"),  # reduce width for padding
+                 heatmap_legend_param = list(
+                   title = "z-score",
+                   direction = "horizontal",
+                   title_position = "topcenter",
+                   legend_direction = "horizontal",
+                   legend_width = unit(4, "cm")
+                 )
+  )
+  
+  plot_list[[signature_name]] = plot
+  
+  plot_id = plot_id + 1
+  
+}
+
+
+##### 
+# Draw the heatmap
+#####
+
+pdf(file = paste0(out_path, time_stamp(), "plot_Heatmap_custom_gene_set_scaled_Walktrap_clusters.pdf"),
+    width = 9, height = 9.5)
+
+for (signature_name in names(plot_list)) {
+  
+  draw(
+    object = plot_list[[signature_name]],
+    heatmap_legend_side = "bottom",
+    annotation_legend_side = "bottom",
+    column_title=signature_name,
+    column_title_gp=grid::gpar(fontsize=16),
+    merge_legend = TRUE
+  )
+  
+}
+
+dev.off()
+
+```
+
+### Tang CRPC signature score matrix
+
+```{r}
+
+Tang_score_mtx <- md %>%
+  group_by(walktrap_75) %>%
+  summarise(across(contains("Tang"), mean)) %>%
+  tibble::column_to_rownames("walktrap_75")  # Makes the walktrap_75 cluster IDs row names
+
+Tang_score_mtx <- as.matrix(Tang_score_mtx) 
+
+plot = Heatmap(matrix = Tang_score_mtx,
+               rect_gp = gpar(col = "white", lwd = 5),
+               cluster_rows = F,
+               column_names_rot = 45,
+               cluster_columns = T,
+               show_column_dend = FALSE,
+               use_raster = TRUE,
+               col_fun <- circlize::colorRamp2(
+                 breaks = c(-0.5, 0, 0.25, 0.5),  # ou plus symétrique : c(-3, 0, 3) selon la distribution
+                 colors = c("#F1F1F1", "#F1F1F1","#F6B62E", "#8B0020")),               width = unit(4, "inch"),  # reduce width for padding
+               height = unit(4, "inch"),
+               column_names_gp = grid::gpar(fontsize = 5),
+               name = "Average signature score", 
+               heatmap_legend_param = list(
+                 direction = "horizontal",
+                 title_position = "topcenter",
+                 legend_direction = "horizontal",
+                 legend_width = unit(4, "cm")
+               )
+)
+
+
+pdf(file = paste0(out_path, time_stamp(), "plot_Heatmap_Tang_Signature.pdf"),
+    width = 5, height = 6.5)
+
+draw(
+  object = plot,
+  heatmap_legend_side = "bottom",
+  annotation_legend_side = "bottom",
+  column_title="Tang",
+  column_title_gp=grid::gpar(fontsize=16),
+  merge_legend = TRUE
+)
+
+dev.off()
+
+```
+
+

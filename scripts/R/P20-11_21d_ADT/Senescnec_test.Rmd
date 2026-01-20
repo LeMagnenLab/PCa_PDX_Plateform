@@ -1,0 +1,24 @@
+---
+title: "TEst_Senescnece"
+author: "Romuald Parmentier"
+date: "2025-07-03"
+output: html_document
+---
+
+```{r}
+
+# # ALIMONTI senescence signature score (https://www.nature.com/articles/s41467-022-29824-1#Sec37)
+# allias = sapply(c("P16", "P15", "P19", "P21", "P27" , "PAI-1"), function(gene){
+#   check_aliase(
+#     sce = sce_obj, 
+#     gene = gene )
+# }
+# )
+# 
+# custom_pathway = tibble(
+#   term = "ALIMONTI_SENESCENCE",
+#   gene = allias
+# )
+
+```
+

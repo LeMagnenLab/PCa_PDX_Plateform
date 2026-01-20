@@ -1,0 +1,755 @@
+---
+title: "8.P20-11 ADT (Only) treated (21 Days): differential expression"
+author: "Romuald Parmentier"
+date: "2025-06-10"
+output: html_document
+---
+
+# Prepare environement
+
+```{r Librarires, functions, palettes, out_path, message = F}
+
+# Libraries
+library(Seurat)
+library(SingleCellExperiment)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(ComplexHeatmap)
+library(ggrepel)
+
+# Functions and palettes
+source("/scicore/home/wykopa75/GROUP/rparmentier/sc_RNAseq/Projects/Prostate/Xenograft_Models/Xenograft_Models_Custom_Functions.R")
+source("/scicore/home/wykopa75/GROUP/rparmentier/sc_RNAseq/Projects/Prostate/Xenograft_Models/Xenograft_Models_Color_Palettes.R")
+
+# Create output path
+out_path = create_exp_folder(
+  organ = "Prostate" ,
+  project = "Xenograft_Models",
+  samples_ID = "P20-11_21d_ADT",
+  exp = "8_Differential_Expression"
+)
+
+```
+
+```{r Load sce object}
+
+file_path = get_exp_file_path(
+  organ = "Prostate",
+  project = "Xenograft_Models",
+  samples_ID = "P20-11_21d_ADT",
+  prev_exp = "7_Clustering",
+  pattern = "sce_obj_clustered.rds") 
+
+sce_obj = readRDS(file = file_path)
+
+```
+
+```{r Transform sce to Seurat object}
+
+seurat_obj = as.Seurat(
+  x = sce_obj, 
+  counts = "counts", 
+  data = "logcounts"
+)
+
+DefaultAssay(seurat_obj) = "originalexp"
+
+# Adds scale.data slot
+seurat_obj = ScaleData(seurat_obj)
+
+```
+
+#######################################################################################################
+#######################################################################################################
+
+# Perform DE between treatments
+
+- Parameters for the DE genes: abs(logFC) > 0.5 & pct.pos > 50%)
+  --> This allows to capture main markers characterizing the groups
+```{r DE on ADT conditions: main markers}
+
+# Set metadata identity
+Idents(seurat_obj) = "Multiplexing_Condition"
+
+ADT_main_markers <- 
+  FindMarkers(
+    object = seurat_obj,
+    ident.1 = "noDHT_noENZA", # Tested
+    ident.2 = "DHT_noENZA" , # CTRL
+    slot = "data",
+    only.pos = F, # True gives only upregulated genes in each cluster against all the others
+    min.pct = 0.5, # Minimum pct of cells expressing the gene in either of the two pop
+    logfc.threshold = 0.5, # Limit testing to genes which show, on average, at least X-fold difference (default)
+    test.use = "MAST") 
+
+ADT_main_markers = as_tibble(ADT_main_markers, rownames = "gene")
+
+# Stat on number of DE genes
+stat_ADT_main_markers <- ADT_main_markers %>%
+  dplyr::filter(p_val_adj < 0.01) %>%   # your filter condition
+  summarise(
+    n_above_0.5 = sum(avg_log2FC > 0.5, na.rm = TRUE),
+    n_below_neg0.5 = sum(avg_log2FC < -0.5, na.rm = TRUE)
+  )
+
+
+# Export the list of genes in seurat and csv
+#############################################
+
+write.csv(
+  x = ADT_main_markers,
+  row.names = F,
+  file = paste0(out_path, time_stamp(),"DE_table_ADT_main_markers.csv")
+)
+
+```
+
+- Parameters for the DE genes:  No FC and pct.pos = 1%
+  --> This allows to get all the genes, they will be scored later to be used in GSEA
+```{r DEA on ADT conditions: input for GSEA}
+
+Idents(seurat_obj) = "Multiplexing_Condition"
+
+ADT_GSEA <- 
+  FindMarkers(
+    object = seurat_obj,
+    ident.1 = "noDHT_noENZA" , #Tested
+    ident.2 = "DHT_noENZA", #CTRL
+    slot = "data",
+    only.pos = F, # Give both up and down-regulated genes in the tested condition vs the CTRL
+    min.pct = 0.01, # Minimum pct of cells expressing the gene in either of the two pop
+    logfc.threshold = 0, # Limit testing to genes which show, on average, at least X-fold difference (default)
+    test.use = "MAST") # Also tried with MAST
+
+ADT_GSEA = as_tibble(ADT_GSEA,rownames = "gene")
+
+write.csv(
+  x = ADT_GSEA,
+  row.names = F,
+  file = paste0(out_path, time_stamp(),"DE_table_ADT_GSEA.csv")
+)
+
+
+```
+
+## Visualization 
+
+```{r Prepare data}
+
+# Load DE table (main markers)
+file_path = get_exp_file_path(
+  organ = "Prostate",
+  project = "Xenograft_Models",
+  samples_ID = "P20-11_21d_ADT",
+  prev_exp = "8_Differential_Expression",
+  pattern = "DE_table_ADT_main_markers.csv")
+
+ADT_main_markers = read.csv(file_path)
+
+# Positive FC mean up-regulated in treated cells and negatives ones mean down-regulated in treated cells
+
+DE_genes_selection <- ADT_main_markers %>%
+  dplyr::filter(abs(avg_log2FC) >= 1.5 & p_val_adj < 1e-20 ) %>%  
+  arrange(desc(avg_log2FC)) %>%
+  ungroup() %>% # Needed otherwise in the next step, the distinct function will work on groups (and thus miss repeated features)
+  distinct(gene, .keep_all = T) %>%
+  pull(gene)
+
+###################
+## Reorder the object
+###################
+
+seurat_obj = as.Seurat(
+  x = sce_obj, 
+  counts = "counts", 
+  data = "logcounts"
+)
+
+# Set the originalexp (aka "RNA" as the default assay)
+DefaultAssay(seurat_obj) = "originalexp"
+
+# Adds scale.data slot
+seurat_obj = ScaleData(seurat_obj)
+
+# Extract scaled data
+seurat_obj_mtx <- GetAssayData(seurat_obj, assay = "originalexp", layer = "scale.data")[DE_genes_selection, ] %>% as.matrix() 
+
+```
+
+```{r Heatmap: split by ADT conition - main markers - z-scores}
+
+heatmap_anno = HeatmapAnnotation(
+  Condition = factor(sce_obj$Multiplexing_Condition, levels = unique(sce_obj$Multiplexing_Condition)),
+  Clusters = sce_obj$walktrap_50, # Already a factor
+  col = list(
+    Condition = pal.treatment,
+    Clusters = pal_clustering),  
+  show_legend = c(Conditions = T, Clusters = T), 
+  show_annotation_name = F)
+
+{
+  
+  # === Build main heatmap ===
+h1 <- Heatmap(
+  matrix = seurat_obj_mtx,
+  name   = "log2(UMI_count)",
+
+  # === Annotation ===
+  top_annotation = heatmap_anno,
+
+  # === Color scale ===
+  col = circlize::colorRamp2(
+    breaks = c(-4, 0, 4),
+    colors = c("darkblue", "white", "darkred")
+  ),
+
+  # === Row settings ===
+  cluster_rows  = FALSE,
+  show_row_dend = FALSE,
+  row_names_gp  = grid::gpar(fontsize = 5),
+
+  # === Column settings ===
+  cluster_columns        = FALSE,  # Set TRUE if you want to cluster cells
+  cluster_column_slices  = FALSE,
+  column_split           = seurat_obj$Multiplexing_Condition,  # Split by clusters
+  show_column_dend       = FALSE,
+  show_column_names      = FALSE,
+
+  # === Rendering options ===
+  use_raster = TRUE,
+  width  = unit(7, "inch"),
+  height = unit(7, "inch"),
+
+  # === Legend ===
+  heatmap_legend_param = list(
+    title            = "log2(UMI_count)",
+    direction        = "horizontal",
+    title_position   = "topcenter",
+    legend_direction = "horizontal",
+    legend_width     = unit(4, "cm")
+  )
+)
+  
+  
+  pdf(
+    file = paste0(out_path,time_stamp(),"plot_Heatmap_High_FC_genes_Zscore_ADT.pdf"),
+    width = 9, height = 9.5)
+  
+  draw(
+    object = h1,
+    heatmap_legend_side = "bottom",
+    annotation_legend_side = "left",
+    column_title = "DE genes (FC > 1.5 | < -1.5)",
+    column_title_gp = grid::gpar(fontsize = 16),
+    merge_legend = F
+  )
+  
+  dev.off()
+  
+}
+
+```
+
+#######################################################################################################
+#######################################################################################################
+
+# Perform DE between clusters
+
+```{r DEA on clusters: main markers}
+
+Idents(seurat_obj) = "louvain_pc20_k45_res0.6"
+
+clusters_main_markers <- 
+  FindAllMarkers(
+    seurat_obj,
+    slot = "data",
+    only.pos = T, # True gives only upregulated genes in each cluster against all the others
+    min.pct = 0.5, # Minimum pct of cells expressing the gene in either of the two pop
+    logfc.threshold = 0.5, # Limit testing to genes which show, on average, at least X-fold difference (default)
+    test.use = "MAST")
+
+
+write.csv(
+  x = clusters_main_markers,
+  file = paste0(out_path, time_stamp(),"DE_table_clusters_main_markers.csv"))
+
+```
+
+```{r DEA on clusters: input for GSEA}
+
+Idents(seurat_obj) = "louvain_pc20_k45_res0.6"
+
+clusters_GSEA <- 
+  FindAllMarkers(
+    seurat_obj,
+    slot = "data",
+    only.pos = F, # True gives only upregulated genes in each cluster against all the others
+    min.pct = 0.9, # Minimum pct of cells expressing the gene in either of the two pop
+    logfc.threshold = 0, # No treshold as it is for gsea
+    test.use = "MAST")
+
+# Export the list of genesin csv
+write.csv(
+  x = clusters_GSEA,
+  file = paste0(out_path, time_stamp(),"DE_table_clusters_GSEA.csv"))
+
+```
+
+## Visualization
+
+- Get main cluster markers data and keep top 15 genes per cluster to draw a heatmap with main markers of each clusters
+```{r Data preparation: top15 cluster markers}
+
+# Load the data
+###############
+
+file_path = get_exp_file_path(
+  organ = "Prostate",
+  project = "Xenograft_Models",
+  samples_ID = "P20-11_21d_ADT",
+  prev_exp = "8_Differential_Expression",
+  pattern = "DE_table_clusters_main_markers.csv")
+
+clusters_main_markers = read.csv(file_path)
+
+# Prepare data
+#################
+
+DE_genes_selection <- clusters_main_markers %>%
+  dplyr::filter(abs(avg_log2FC) >= 1.5 & p_val_adj < 1e-20) %>%  
+  group_by(cluster) %>%
+  arrange(desc(avg_log2FC)) %>%
+  slice_head(n = 15) %>%
+  ungroup() %>% # Needed otherwise in the next ytep, the distinct function will work on groups (and thus miss repeated features)
+  distinct(gene, .keep_all = T) %>%
+  pull(gene)
+
+DE_genes_selection = intersect(DE_genes_selection, rownames(seurat_obj))
+
+
+## Reorder the object
+###################
+
+# Sort metadata column "by cluster and then by treatment condition
+ordered_indices <- order(sce_obj$louvain_pc20_k45_res0.6, sce_obj$Multiplexing_Condition)
+
+# Reorder columns (cells) of the SCE object
+sce_obj <- sce_obj[, ordered_indices]
+
+seurat_obj = as.Seurat(
+  x = sce_obj, 
+  counts = "counts", 
+  data = "logcounts"
+)
+
+# Set the originalexp (aka "RNA" as the default assay)
+DefaultAssay(seurat_obj) = "originalexp"
+
+# Adds scale.data slot
+seurat_obj = ScaleData(seurat_obj)
+
+# Extract scaled data
+seurat_obj_mtx <- GetAssayData(seurat_obj, assay = "originalexp", layer = "scale.data")[DE_genes_selection, ] %>% as.matrix()
+
+```
+
+```{r Heatmap: Z-score - split by cluster main markers}
+
+# Top annotations
+#################
+heatmap_anno = HeatmapAnnotation(
+  Clusters = factor(sce_obj$louvain_pc20_k45_res0.6, levels = unique(sce_obj$louvain_pc20_k45_res0.6)), # Has to be a factor
+  Condition = factor(sce_obj$Multiplexing_Condition, levels = unique(sce_obj$Multiplexing_Condition)),
+  col = list(
+    Clusters = pal_clustering_bis,
+    Condition = pal.treatment,
+    DHT_Status = pal.dht.status),  
+  show_legend = c(Clusters = T , Conditions = T), 
+  show_annotation_name = T)
+
+# === Build main heatmap ===
+h1 <- Heatmap(
+  matrix = seurat_obj_mtx,
+  name   = "log2(UMI_count)",
+
+  # === Annotation ===
+  top_annotation = heatmap_anno,
+
+  # === Color scale ===
+  col = circlize::colorRamp2(
+    breaks = c(-4, 0, 4),
+    colors = c("darkblue", "white", "darkred")
+  ),
+
+  # === Row settings ===
+  cluster_rows  = FALSE,
+  show_row_dend = FALSE,
+  row_names_gp  = grid::gpar(fontsize = 5),
+
+  # === Column settings ===
+  cluster_columns        = FALSE,  # Set TRUE if you want to cluster cells
+  cluster_column_slices  = FALSE,
+  column_split           = seurat_obj$louvain_pc20_k45_res0.6,  # Split by clusters
+  show_column_dend       = FALSE,
+  show_column_names      = FALSE,
+
+  # === Rendering options ===
+  use_raster = TRUE,
+  width  = unit(7, "inch"),
+  height = unit(7, "inch"),
+
+  # === Legend ===
+  heatmap_legend_param = list(
+    title            = "log2(UMI_count)",
+    direction        = "horizontal",
+    title_position   = "topcenter",
+    legend_direction = "horizontal",
+    legend_width     = unit(4, "cm")
+  )
+)
+
+# === Save heatmap to PDF ===
+pdf(
+  file   = paste0(out_path, time_stamp(), "plot_Heatmap_clusters_main_markers.pdf"),
+  width  = 9,
+  height = 9.5
+)
+
+# === Draw the heatmap ===
+draw(
+  object = h1,
+  column_title = "Top 20 DE genes",
+  column_title_gp = grid::gpar(fontsize = 16),
+  heatmap_legend_side = "bottom",
+  annotation_legend_side = "bottom",
+  merge_legend = TRUE
+)
+
+dev.off()
+
+```
+
+- Get GSE DE table to plot all DE genes (MA plot) according mean expression and logFC
+```{r Data preparation: ADT DE Genes }
+
+# Get GSEA DE table
+###################
+
+file_path = get_exp_file_path(
+  organ = "Prostate" ,
+  project = "Xenograft_Models",
+  samples_ID = "P20-11_21d_ADT",
+  prev_exp = "8_Differential_Expression",
+  pattern = "DE_table_clusters_GSEA.csv")
+
+DE_table_clusters_GSEA = read.csv(file_path)
+
+# Load DE table results (GSEA input)
+####################################
+
+file_path = get_exp_file_path(
+  organ = "Prostate",
+  project = "Xenograft_Models",
+  samples_ID = "P20-11_21d_ADT",
+  prev_exp = "8_Differential_Expression",
+  pattern = "DE_table_ADT_GSEA.csv")
+
+DE_table_ADT_GSEA = read.csv(file_path)
+
+HALLMARK = read.gmt("/scicore/home/wykopa75/GROUP/rparmentier/sc_RNAseq/Projects/Sequencing_Data/Gene_sets/MSigDB_HALLMARKS_hs_v2023_2.gmt")
+HALLMARK_ANDROGEN_genes = HALLMARK %>% dplyr::filter(term == "HALLMARK_ANDROGEN_RESPONSE") %>% pull(gene)
+
+
+# Compute significance indicators and log10 p-value
+DE_table_ADT_GSEA$log10_p_val <- -log10(DE_table_ADT_GSEA$p_val_adj)
+
+# Flag genes (p-value or cluster-specific enrichment)
+####################################################
+
+# For p-value
+DE_table_ADT_GSEA$significant <- ifelse(DE_table_ADT_GSEA$p_val_adj < 0.001, "yes", "no")
+
+# For cluster specificity
+DE_genes_ADT = DE_table_ADT_GSEA %>% 
+  dplyr::filter(avg_log2FC > 2 & p_val_adj < 1e-3) %>% pull(gene)
+
+DE_genes_clusters_GSEA_filtered = DE_table_clusters_GSEA %>%
+  dplyr::filter(gene %in% DE_genes_ADT) %>%
+  dplyr::filter(avg_log2FC > 2 & p_val_adj < 1e-3) 
+
+DE_table_ADT_GSEA = left_join(x = DE_table_ADT_GSEA, y = DE_genes_clusters_GSEA_filtered, by = "gene", suffix = c("",".y"),) 
+DE_table_ADT_GSEA = DE_table_ADT_GSEA %>% dplyr::select(-c(ends_with(".y"), "X"))
+DE_table_ADT_GSEA$cluster = as.character(DE_table_ADT_GSEA$cluster)
+
+DE_table_ADT_GSEA = DE_table_ADT_GSEA %>% 
+  mutate(cluster = case_when(
+    gene %in% HALLMARK_ANDROGEN_genes ~ "AR-controlled",
+    is.na(cluster) ~ "non-specific",
+    TRUE ~ cluster)
+  )
+
+
+# Compute average expression from logcounts
+###########################################
+DE_table_ADT_GSEA$avg_expression <- rowMeans(as.matrix(logcounts(sce_obj)[DE_table_ADT_GSEA$gene,]))
+
+
+DE_table_ADT_GSEA = DE_table_ADT_GSEA %>% 
+  mutate(label_gene = case_when(
+    (abs(avg_log2FC) > 2 & cluster != "non-specific") | (avg_expression > 2 & cluster != "non-specific") ~ gene,
+    gene %in% c("ERG", "AR", "PROX1") ~ gene,
+    TRUE ~ NA)
+  )
+
+```
+
+```{r MA plot (Figure 4C): colored by HALLMARK_ANDROGEN or cluster specific enrichement}
+
+plot = ggplot(data = DE_table_ADT_GSEA, aes(x = avg_expression, y = avg_log2FC)) + 
+  # Non significant genes (rastreized)
+  ggrastr::rasterise(geom_point(
+    data = DE_table_ADT_GSEA %>% dplyr::filter(significant == "no" | abs(avg_log2FC) < 1),
+    fill = "lightgrey", color = "black", stroke = 0.1, alpha = 0.4, size = 0.5, shape = 21),
+    dpi = 900, scale = 2) +
+  # Non cluster-specific genes (rasterized)
+  ggrastr::rasterise(geom_point(
+    data = DE_table_ADT_GSEA %>% dplyr::filter(significant == "yes" & cluster == "non-specific"),
+    aes(fill = cluster), alpha = 0.8, size = 2, shape = 21),
+    dpi = 900, scale = 1) +
+  # FC and significant genes
+  geom_point(
+    data = DE_table_ADT_GSEA %>% dplyr::filter(significant == "yes" & cluster != "non-specific" ) %>% arrange(desc(cluster)), 
+    aes(fill = cluster), alpha = 0.8, size = 2, shape = 21) +
+  scale_fill_manual( values = c( "3" = "#8A9197FF", "4" = "#D2AF81FF", "6" = "#4B0082", "AR-controlled" = "cyan", "non-specific" = "#E9E0E0")) + 
+  # Labels for up-regulated genes
+  geom_text_repel(
+    data = DE_table_ADT_GSEA %>% dplyr::filter(significant == "yes", avg_log2FC > 0),
+    aes(label = label_gene, colour = cluster),
+    size = 2,
+    nudge_y = 0.8,
+    nudge_x = 0.5,
+    segment.size = 0.3,
+    box.padding = 0.3,
+    point.padding = 0.2,
+    segment.curvature = -0.2,    # Optional: add slight curve
+    max.overlaps = 30,
+    direction = "both",
+    min.segment.length = 0.1,
+    segment.colour = "black",
+    segment.alpha = 0.8
+  ) +
+  
+  # Labels for downregulated genes
+  geom_text_repel(
+    data = DE_table_ADT_GSEA %>% dplyr::filter(significant == "yes", avg_log2FC < 0),
+    aes(label = label_gene, colour = cluster),
+    size = 2,
+    nudge_y = -0.8,
+    nudge_x = 0.5,
+    segment.size = 0.3,
+    box.padding = 0.3,
+    point.padding = 0.2,
+    max.overlaps = 30,
+    direction = "both",  
+    segment.curvature = 0.2,    # Optional: add slight curve
+    min.segment.length = 0.1,
+    segment.colour = "black",
+    segment.alpha = 0.8
+  ) +
+  scale_colour_manual(values = c( "3" = "#8A9197FF", "4" = "#D2AF81FF", "6" = "#4B0082", "AR-controlled" = "black")) + 
+  theme_classic() + 
+  labs(title = paste0("Cluster 6")) +
+  guides(
+    alpha = "none",
+    size = "none",
+    colour = "none",
+    fill = "none"
+  ) 
+
+ggsave(
+  plot = plot,
+  filename = paste0(out_path, time_stamp(), "plot_MA_ADT_colored_by_cluster.pdf"),
+  width = 6,
+  height = 4,device = "pdf"  )
+
+```
+
+```{r UMAP facetted (Figure 4.D): colored by Z-score - density of positive cells (> 0.5)}
+
+# Exreact metddata
+md = colData(sce_obj)
+md = as_tibble(md)
+
+md$UMAP_1 = reducedDim(sce_obj, type = "UMAP_on_PCA.1-20")[, 1]
+md$UMAP_2 = reducedDim(sce_obj, type = "UMAP_on_PCA.1-20")[, 2]
+
+plot_list = list()
+gene_list = c("ALDH1A1", "KLK3", "PROX1", "KLK2", "CHGB", "FKBP5")
+
+for(gene in seq_along(gene_list)){
+  
+  gene_name = gene_list[gene]
+  
+  md$gene_expression = GetAssayData(seurat_obj,assay = "originalexp", slot = "scale.data",)[gene_name,]
+  md$gene_expression = scale(logcounts(sce_obj)[gene_name,])
+  
+  plot <- ggplot(data = md, aes(x = UMAP_1, y = UMAP_2)) +
+    # First layer of cells with expression z-score arround 0
+    ggrastr::rasterise(
+      geom_point(
+        data = md %>% dplyr::filter(gene_expression > - 0.5 & gene_expression < 0.5),
+        aes(fill = gene_expression),   # fill controlled by gene expression
+        shape = 21,                    # circle with border
+        colour = "black",              # visible stroke color
+        stroke = 0.2,                  # border thickness
+        size = 1,
+        alpha = 0.4),
+      dpi = 300,
+      scale = 0.7) +
+  # Second layer of cells with expression z-score above/below 0.5/-0.5
+  geom_point(
+    data = md %>% dplyr::filter(gene_expression < -0.5 | gene_expression > 0.5),
+    aes(fill = gene_expression),   # fill controlled by gene expression
+    shape = 21,                    # circle with border
+    colour = "black",              # visible stroke color
+    stroke = 0.2,                  # border thickness
+    size = 0.9,
+    alpha = 1) +
+  # Apply a custom continuous color scale
+  scale_fill_gradientn(
+    colours = c("blue", "white", "red"),
+    limits = c(-max(abs(md$gene_expression)), max(abs(md$gene_expression))),  # symmetric range
+    name = "Z-score"
+  ) +
+  stat_density_2d(data = md %>% dplyr::filter(gene_expression > 0.5),
+                  mapping = aes(col = ..level.. ),
+                  geom = "path", size = 0.7) +
+  scale_color_gradientn(
+    colours = c( paletteer_c("ggthemes::Red-Gold", 30)),
+    name = "Z-score"
+  ) +
+  theme_classic() +
+  # Remove unwanted legends
+  guides(
+    # fill = "none",
+    alpha = "none",
+    size = "none",
+    col = "none"
+  ) +
+  ggtitle(gene_name) +
+  theme(
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank()) +
+  xlim(c(-6, 7)) +
+  ylim(-6, 8)
+
+plot 
+
+plot_list[[gene_name]] = plot
+
+}
+
+list_of_grobs = marrangeGrob(
+  grobs = plot_list,
+  ncol = 3,
+  nrow = 2)
+
+ggsave(
+  plot = list_of_grobs,
+  filename = paste0(out_path, time_stamp(), "plots_dotplot_density_gene_list.pdf"),
+  width = 7, height = 5, 
+  device = "pdf"
+)
+
+```
+
+```{r UMAP facetted (Figure 4.D): colored by Z-score - density of positive cells (> 0.5)}
+
+# Exreact metddata
+md = colData(sce_obj)
+md = as_tibble(md)
+
+md$UMAP_1 = reducedDim(sce_obj, type = "UMAP_on_PCA.1-20")[, 1]
+md$UMAP_2 = reducedDim(sce_obj, type = "UMAP_on_PCA.1-20")[, 2]
+
+plot_list = list()
+gene_list = c("ALDH1A1", "KLK3", "PROX1", "SOX2", "AR", "SYP", "CHGA")
+
+for(gene in seq_along(gene_list)){
+  
+  gene_name = gene_list[gene]
+  
+  md$gene_expression = GetAssayData(seurat_obj,assay = "originalexp", slot = "scale.data",)[gene_name,]
+  md$gene_expression = scale(logcounts(sce_obj)[gene_name,])
+  
+  plot <- ggplot(data = md, aes(x = UMAP_1, y = UMAP_2)) +
+    # First layer of cells with expression z-score arround 0
+    ggrastr::rasterise(
+      geom_point(
+        data = md %>% dplyr::filter(gene_expression > - 0.5 & gene_expression < 0.5),
+        aes(fill = gene_expression),   # fill controlled by gene expression
+        shape = 21,                    # circle with border
+        colour = "black",              # visible stroke color
+        stroke = 0.2,                  # border thickness
+        size = 1,
+        alpha = 0.4),
+      dpi = 300,
+      scale = 0.7) +
+  # Second layer of cells with expression z-score above/below 0.5/-0.5
+  geom_point(
+    data = md %>% dplyr::filter(gene_expression < -0.5 | gene_expression > 0.5),
+    aes(fill = gene_expression),   # fill controlled by gene expression
+    shape = 21,                    # circle with border
+    colour = "black",              # visible stroke color
+    stroke = 0.2,                  # border thickness
+    size = 0.9,
+    alpha = 1) +
+  # Apply a custom continuous color scale
+  scale_fill_gradientn(
+    colours = c("blue", "white", "red"),
+    limits = c(-max(abs(md$gene_expression)), max(abs(md$gene_expression))),  # symmetric range
+    name = "Z-score"
+  ) +
+  #Third layer with density of positive cells
+  # stat_density_2d(data = md %>% dplyr::filter(gene_expression > 0.5),
+  #                 mapping = aes(col = ..level.. ),
+  #                 geom = "path", size = 0.7) +
+  # scale_color_gradientn(
+  #   colours = c( paletteer_c("ggthemes::Red-Gold", 30)),
+  #   name = "Z-score"
+  # ) +
+  theme_classic() +
+  # Remove unwanted legends
+  guides(
+    # fill = "none",
+    alpha = "none",
+    size = "none",
+    col = "none"
+  ) +
+  ggtitle(gene_name) +
+  theme(
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank()) +
+  xlim(c(-6, 7)) +
+  ylim(-6, 8)
+
+plot 
+
+plot_list[[gene_name]] = plot
+
+}
+
+list_of_grobs = marrangeGrob(
+  grobs = plot_list,
+  ncol = 3,
+  nrow = 2)
+
+ggsave(
+  plot = list_of_grobs,
+  filename = paste0(out_path, time_stamp(), "plots_UMAP_zscore_density_gene_of_interest.pdf"),
+  width = 7, height = 5, 
+  device = "pdf"
+)
+
+```

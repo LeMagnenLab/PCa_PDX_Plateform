@@ -1,0 +1,733 @@
+---
+title: "Untitled"
+author: "Romuald Parmentier"
+date: "2025-07-28"
+output: html_document
+---
+
+```{r Prepare environment, message = F}
+
+# Libraries
+library(SingleCellExperiment)
+library(dplyr)
+library(scran)
+library(scater)
+library(dplyr)
+library(purrr)
+library(scclusteval)
+
+# Functions and palettes
+source("/scicore/home/wykopa75/GROUP/rparmentier/sc_RNAseq/Projects/Prostate/Xenograft_Models/Xenograft_Models_Custom_Functions.R")
+source("/scicore/home/wykopa75/GROUP/rparmentier/sc_RNAseq/Projects/Prostate/Xenograft_Models/Xenograft_Models_Color_Palettes.R")
+
+# Create output path (adapted)
+out_path = create_exp_folder(
+  organ = "Prostate",
+  project = "Xenograft_Models",
+  samples_ID = "P20-11_21d_ADT",
+  exp = "7_Clustering"
+)
+
+```
+
+# Prepare the data
+
+```{r Load the files}
+
+file_path = get_exp_file_path(
+  organ = "Prostate",
+  project = "Xenograft_Models",
+  samples_ID = "P20-11_21d_ADT",
+  prev_exp = "6_Dimension_Reduction",  
+  pattern = "sce_obj_dim_reduced.rds")
+
+sce_obj = readRDS(file_path)
+
+```
+
+```{r Louvain with k + reso}
+
+# Define parameter ranges
+k_ids <- c(15, 30, 45, 60, 75, 90)
+resolutions <- c(0.4, 0.5, 0.6, 0.8, 1)
+PCs = c("PCA.1-10", "PCA.1-20", "PCA.1-100")
+
+# Initialize list to store results
+fullsample_idents <- tibble()
+
+# Loop over resolution and k
+for(PC in PCs) {
+  
+  for (res in resolutions) {
+    
+    for (k_id in k_ids) {
+      
+      message(glue::glue("Clustering with PC = {PC}, k = {k_id}, resolution = {res}"))
+      
+      # Perform clustering
+      clustering_data <- clusterCells(
+        sce_obj,
+        use.dimred = PC,
+        BLUSPARAM = bluster::SNNGraphParam(
+          k = k_id,
+          type = "jaccard",
+          cluster.fun = "louvain",
+          cluster.args = list(resolution = res)
+        )
+      )
+      
+      names(clustering_data) = colnames(sce_obj)
+      
+      fullsample_idents = bind_rows(
+        fullsample_idents,
+        tibble(
+          pc = PC,
+          resolution = as.character(res),
+          k_param = as.character(k_id),
+          original_ident_full = list(clustering_data)
+        )
+      )
+      
+    }
+  }
+  
+  
+  
+}
+
+# Add cluster number per set of parameters
+fullsample_idents = fullsample_idents %>%
+  mutate(cluster_num = purrr::map_dbl(original_ident_full, ~length(unique(.x))))
+
+saveRDS(object = fullsample_idents,
+        file = paste0(out_path,time_stamp(),"fullsample_idents.rds"))
+
+
+```
+
+```{r Define bootstrapping function}
+
+BootstrapClusteringTibble <- function(sce_obj,
+                                      dimred,
+                                      cluster.fun,
+                                      type,
+                                      k_id,
+                                      resolution,
+                                      n_boot,
+                                      prop = 0.8,
+                                      seed = 42) {
+  set.seed(seed)
+  subsample_idents_tbl = list()
+  
+  for(round in 1:n_boot){
+    
+    # Downsampling colnames (= cell_id)
+    sampled_cells <- sample(colnames(sce_obj), size = floor(ncol(sce_obj) * prop))
+    
+    # Sous-ensemble
+    subset_sce <- sce_obj[, sampled_cells]
+    
+    # Clustering with same parameters as original clustering
+    paste0("Round ", 1 - round)
+    
+    reclust <- clusterCells(
+      subset_sce,
+      use.dimred = dimred,
+      BLUSPARAM = bluster::SNNGraphParam(k = k_id, 
+                                         type = type, 
+                                         cluster.args = list(resolution = resolution),
+                                         cluster.fun = cluster.fun)
+    )
+    
+    names(reclust) <- colnames(subset_sce)  # restore cell names explicitly
+    
+    original_ids <- fullsample_idents %>% filter(pc == PC, resolution == resolution, k_param == k_id) %>% pull(original_ident_full) %>% unlist()
+    
+    # Get index of original_sce that match the sample
+    sampled_original_id = match(sampled_cells, names(original_ids), nomatch = NULL)
+    sampled_original_id = sampled_original_id[!is.na(sampled_original_id)]
+    
+    # Rereorder the original_ids according the order of the subsampling
+    original_ids = original_ids[sampled_original_id]
+    
+    # Store in a tible where original and reslut id are lists
+    results =  tibble(
+      original_ident = list(original_ids),
+      recluster_ident = list(reclust),
+      round = as.character(round)
+    )
+    
+    subsample_idents_tbl = bind_rows(subsample_idents_tbl, results)
+    
+  }
+  
+  return(subsample_idents_tbl)
+  
+}
+
+```
+
+```{r Perform bootstrapping}
+
+# Define parameter ranges
+k_ids <- c(15, 30, 45, 60, 75, 90)
+resolutions <- c(0.4, 0.5, 0.6, 0.8, 1)
+PCs = c("PCA.1-10", "PCA.1-20", "PCA.1-100")
+
+# Initialize list to store results
+subsample_idents <- tibble()
+
+# Loop over resolution and k
+
+for(PC in PCs){
+  
+  for (k_id in k_ids) {
+    
+    for (res in resolutions) {
+      
+      message(glue::glue("Clustering with PC = {PC}, k = {k_id}, resolution = {res}"))
+      
+      data_subsample = BootstrapClusteringTibble(
+        sce_obj = sce_obj,
+        dimred = PC,
+        cluster.fun = "louvain",
+        type = "jaccard",
+        k = k_id ,
+        resolution = res,
+        n_boot = 50,
+        prop = 0.8,
+        seed = 42)
+      
+      subsample_idents = bind_rows(
+        subsample_idents,
+        tibble(
+          pc = PC,
+          resolution = as.character(res),
+          k_param = as.character(k_id),
+          data = list(data_subsample)
+        )
+      )
+    }
+    
+  }    
+  
+}
+
+
+
+saveRDS(object = subsample_idents,
+        file = paste0(out_path,time_stamp(),"subsample_idents.rds"))
+
+
+```
+
+```{r Reload clustering results}
+
+# Original clustering results (all dataset)
+fullsample_idents = get_exp_file_path(
+  organ = "Prostate",
+  project = "Xenograft_Models",
+  samples_ID = "P20-11_21d_ADT",
+  prev_exp = "7_Clustering",  
+  pattern = "fullsample_idents.rds")
+
+fullsample_idents = readRDS(fullsample_idents)
+
+# Bootstrapping results (partial dataset clustering)
+subsample_idents = get_exp_file_path(
+  organ = "Prostate",
+  project = "Xenograft_Models",
+  samples_ID = "P20-11_21d_ADT",
+  prev_exp = "7_Clustering",  
+  pattern = "subsample_idents.rds")
+
+subsample_idents = readRDS(subsample_idents)
+
+```
+
+```{r Rename PCs to comply with facet requirements later}
+
+# Rename PCs to use it as facets
+fullsample_idents = fullsample_idents %>% 
+  mutate(pc = case_when(
+    pc == "PCA.1-10" ~ "10",
+    pc == "PCA.1-20" ~ "20",
+    pc == "PCA.1-100" ~ "100"))
+
+subsample_idents = subsample_idents %>% 
+  mutate(pc = case_when(
+    pc == "PCA.1-10" ~ "10",
+    pc == "PCA.1-20" ~ "20",
+    pc == "PCA.1-100" ~ "100")) 
+
+```
+
+
+```{r Assign stability to all clusters }
+
+stable_clusters <- subsample_idents %>%
+  mutate(stable_cluster = map(data, ~ AssignStableCluster(.x$original_ident,
+                                                          .x$recluster_ident,
+                                                          jaccard_cutoff = 0.8,
+                                                          method = "jaccard_percent", 
+                                                          percent_cutoff = 0.8)))
+
+```
+
+```{r Facet scatter plots of parameters vs cluster stability}
+
+plot = ParameterSetScatterPlot(stable_clusters = stable_clusters,
+                               fullsample_idents = fullsample_idents,
+                               x_var = "k_param",
+                               y_var = "number",
+                               facet_rows = "resolution",
+                               facet_cols = "pc") +
+  scale_y_continuous(name = "number of clusters", n.breaks = 10)
+
+
+# Save the arranged plots to a multi-page PDF
+ggsave(
+  plot = plot,
+  filename = paste0(out_path,time_stamp(),"plots_parameter_stability.pdf"),
+  device = "pdf",
+  width = 12,
+  height = 8
+)
+
+```
+
+```{r Test promising parameters combination}
+
+parameters_to_test = list(
+  c("20", 45, 0.6),
+  c("20", 30, 0.8)
+)
+
+plot_list = list()
+
+for(set in seq_along(parameters_to_test)){
+  
+  subsample_idents_test = subsample_idents %>% filter(
+    pc == parameters_to_test[[set]][1], 
+    k_param == parameters_to_test[[set]][2], 
+    resolution == parameters_to_test[[set]][3]) %>% 
+    pull(data)
+  
+  plot = JaccardRainCloudPlot(subsample_idents_test[[1]]$original_ident,
+                              subsample_idents_test[[1]]$recluster_ident) + 
+    geom_hline(yintercept = c(0.6, 0.75), linetype = 2) +
+    ggtitle(paste0(
+      "PC = 1-", parameters_to_test[[set]][1],
+      " | k_param = ", parameters_to_test[[set]][2],
+      " | resolution = ", parameters_to_test[[set]][3]))
+  
+  plot_list[[set]] = plot
+  
+}
+
+# Arrange plots in a multi-page layout (2 plots per page)
+multiple_page_layout <- gridExtra::marrangeGrob(
+  grobs = plot_list,
+  nrow = 2, ncol = 1  # Define layout (2 rows, 1 column per page)
+)
+
+# Save the arranged plots to a multi-page PDF
+ggsave(
+  plot = multiple_page_layout,
+  filename = paste0(out_path,time_stamp(),"plots_Jaccard_RainCloup_Promising_Parameters.pdf"),
+  device = "pdf",
+  width = 8, height = 8
+)
+
+```
+
+```{r Add promising parameters combination to sce_obj}
+
+parameters_to_test = list(
+  c(pc = "20", k_param = 45, resolution = 0.6),
+  c(pc = "20", k_param = 30, resolution = 0.8)
+)
+
+# Loop over the selected parameters
+for (param in parameters_to_test) {
+  
+  # Extract current parameter values
+  pc_val <- as.character(param["pc"])
+  k_val <- as.character(param["k_param"])
+  res_val <- as.character(param["resolution"])
+  
+  # Build column name to add
+  col_name <- paste0("louvain_pc", pc_val, "_k", k_val, "_res", res_val)
+  
+  # Filter tibble for matching row
+  match_row <- fullsample_idents %>%
+    filter(pc == pc_val, 
+           k_param == k_val, 
+           resolution == res_val)
+  
+  # Sanity check
+  if (nrow(match_row) != 1) {
+    warning(glue::glue("No unique match found for pc={pc_val}, k={k_val}, res={res_val}"))
+    next
+  }
+  
+  # Extract identity vector and set names if missing
+  ident_vector <- match_row$original_ident_full[[1]]
+  if (is.null(names(ident_vector))) {
+    names(ident_vector) <- colnames(sce_obj)
+  }
+  
+  # Add to colData
+  colData(sce_obj)[[col_name]] <- ident_vector
+}
+
+
+```
+
+```{r Export sce with clusters}
+
+saveRDS(object = sce_obj,
+        file = paste0(out_path, time_stamp(), "sce_obj_clustered.rds")
+        )
+
+```
+
+# Visualize clustering
+
+```{r Reload sce after clustering}
+
+file_path = get_exp_file_path(
+  organ = "Prostate",
+  project = "Xenograft_Models",
+  samples_ID = "P20-11_21d_ADT",
+  prev_exp = "7_Clustering",  
+  pattern = "sce_obj_clustered.rds")
+
+sce_obj = readRDS(file_path)
+
+```
+
+```{r Make a tibble of metadata}
+
+# get metadata
+md <- as_tibble(colData(sce_obj))
+
+# get embeddings from 2 first PC
+coords <- as_tibble(reducedDim(sce_obj, "UMAP_on_PCA.1-20"))[,1:2]
+colnames(coords) = c("UMAP_1","UMAP_2")
+
+# combine dataframes
+md <- cbind(md, coords)
+
+```
+
+```{r Facette UMAP colord with cluster number according louvain k values}
+
+plot_id = 1            # Initialize plot ID counter
+plot_list = list()     # Initialize empty list to store plots
+
+# Loop over the selected parameters
+for (param in parameters_to_test) {
+  
+  # Extract current parameter values
+  pc_val <- as.character(param["pc"])
+  k_val <- as.character(param["k_param"])
+  res_val <- as.character(param["resolution"])
+  
+  # Build column name to add
+  col_name <- paste0("louvain_pc", pc_val, "_k", k_val, "_res", res_val) # Construct the clustering column name
+  
+  # Calculate centroids for each cluster
+  centroids <- md %>%
+    group_by(.data[[col_name]]) %>%
+    summarise(
+      UMAP_1 = mean(UMAP_1),
+      UMAP_2 = mean(UMAP_2),
+      .groups = 'drop'
+    )
+  
+  # Create ggplot with rasterized points for each clustering
+  plot <- ggplot() +
+    # Rasterize the geom_point layer
+    ggrastr::rasterise(
+      geom_point(
+        data = md,  # DataFrame containing UMAP coordinates and clustering info
+        aes(x = UMAP_1, y = UMAP_2, fill = .data[[col_name]]),  # Use the dynamic clustering column
+        alpha = 0.7, size = 1.3, 
+        shape = 21, color = "gray10", stroke = 0.2  # Lighter stroke color
+      ), 
+      dpi = 300, scale = 1  # Higher DPI and scale for better resolution
+    ) +
+    scale_fill_manual(values = pal_clustering) +  # Use predefined color palette
+    theme_classic() +  # Clean background
+    guides(
+      alpha = "none", 
+      size = "none"
+    ) +
+    ggtitle(label = "Dolgos 2024 Early Passage PDO: louvain clustering",
+            subtitle = col_name)  +
+  # Add cluster numbers in the center of each cluster
+  geom_text(
+    data = centroids,
+    aes(x = UMAP_1, y = UMAP_2, label = .data[[col_name]]),
+    color = "black",  # Color for the cluster numbers
+    size = 7,  # Adjust size as needed
+    fontface = "bold"
+  )
+  
+  
+  plot_list[[plot_id]] = plot  # Add the plot to the list
+  plot_id = plot_id + 1        # Increment plot ID
+}
+
+# Arrange plots in a multi-page layout (2 plots per page)
+multiple_page_layout <- gridExtra::marrangeGrob(
+  grobs = plot_list,
+  nrow = 2, ncol = 1  # Define layout (2 rows, 1 column per page)
+)
+
+# Save the arranged plots to a multi-page PDF
+ggsave(
+  plot = multiple_page_layout,
+  filename = paste0(out_path,time_stamp(),"plots_UMAP_Facetted_louvain_clustering_promising.pdf"),
+  device = "pdf",
+  width = 210, height = 297, units = "mm"
+)
+
+```
+
+```{r Single UMAP colored with clustering of choice = louvain_pc20_k45_res0.6 -> (Figure version)}
+
+# Calculate centroids for each cluster
+centroids <- md %>%
+  group_by(louvain_pc20_k45_res0.6) %>%
+  summarise(
+    UMAP_1 = mean(UMAP_1),
+    UMAP_2 = mean(UMAP_2),
+    .groups = 'drop'
+  )
+
+plot <- ggplot() +
+  # Rasterise the first layer
+    geom_point(
+      data = md,
+      aes(x = UMAP_1, y = UMAP_2, fill = louvain_pc20_k45_res0.6), 
+      alpha = 0.9, size = 3, 
+      shape = 21,
+      color = "gray10",
+      stroke = 0.2) +
+    scale_fill_manual(values = pal_clustering_bis) +
+  theme_classic() +
+  guides(
+    fill = "none",
+    alpha = "none",
+    size = "none"
+  ) +
+  # Add cluster numbers in the center of each cluster
+  geom_label(
+    data = centroids,
+    aes(x = UMAP_1, y = UMAP_2, fill = louvain_pc20_k45_res0.6, colour = "black", label = louvain_pc20_k45_res0.6),
+    color = "black",  # Color for the cluster numbers
+    size = 7,  # Adjust size as needed
+    fontface = "bold"
+  ) 
+  
+
+
+ggsave(
+  plot = plot,
+  filename = paste0(out_path,time_stamp(),"plot_UMAP_louvain_pc20_k45_res0.6_Figure.pdf"),
+  device = "pdf",
+  width = 6,
+  height = 6,
+)
+
+
+```
+
+```{r Single UMAP colored with treatment -> (Figure version)}
+
+plot <- ggplot() +
+  # Rasterise the first layer
+    geom_point(
+      data = md,
+      aes(x = UMAP_1, y = UMAP_2, fill = Multiplexing_Condition), 
+      alpha = 0.9, size = 3, 
+      shape = 21,
+      color = "gray10",
+      stroke = 0.2) +  # Lighter stroke color (adjust as needed)),# Ensure shape supports fill and color
+  scale_fill_manual(values = pal.treatment) +
+  theme_classic() +
+  guides(
+    fill = "none",
+    alpha = "none",
+    size = "none"
+  ) 
+
+ggsave(
+  plot = plot,
+  filename = paste0(out_path,time_stamp(),"plot_UMAP_treatment_Figure.pdf"),
+  device = "pdf",
+  width = 6,
+  height = 6,
+)
+
+```
+
+## Proportion of cells in clusters
+
+```{r Proportion of cells in clusters against treatment}
+
+# Percentage of cells in each condition
+pct_multiplexing_condition <- md %>% 
+  group_by(Multiplexing_Condition) %>% 
+  summarise(pct = round(((n()/nrow(md))*100), 0))
+
+# Percentage of cells in each cluster
+pct_cluster <- md %>% 
+  group_by(louvain_pc20_k45_res0.6) %>% 
+  summarise(pct = round(((n()/nrow(md))*100), 0))
+
+# Percentage of cells ba cluster among each condition
+count_cluster_by_condition <- md %>% 
+  group_by(Multiplexing_Condition, louvain_pc20_k45_res0.6) %>% 
+  summarise(count = n())
+
+pct_cluster_by_condition <- count_cluster_by_condition %>%
+  group_by(Multiplexing_Condition) %>%
+  mutate(Percentage = count / sum(count) * 100) %>%
+  group_by(Multiplexing_Condition) %>%
+  arrange(louvain_pc20_k45_res0.6, Percentage)
+
+pct_condition_by_cluster <- count_cluster_by_condition %>%
+  group_by(louvain_pc20_k45_res0.6) %>%
+  mutate(Percentage = count / sum(count) * 100) %>%
+  group_by(louvain_pc20_k45_res0.6) %>%
+  arrange(louvain_pc20_k45_res0.6, Percentage)
+
+
+#  Count Cell cycle by cluster
+count_cycle_by_cluster <- md %>% 
+  group_by(louvain_pc20_k45_res0.6, cell_cycle_phase) %>% 
+  summarise(count = n())
+
+# Pct cell cycle by cluster
+pct_cycle_by_cluster <- count_cycle_by_cluster %>%
+  group_by(louvain_pc20_k45_res0.6) %>%
+  mutate(Percentage = count / sum(count) * 100) %>%
+  group_by() %>%
+  arrange(louvain_pc20_k45_res0.6, Percentage)
+
+```
+
+```{r Donut plot proportion per cluster in conditions : Figure 4}
+
+pct_cluster_by_condition = pct_cluster_by_condition  %>%
+  group_by(Multiplexing_Condition) %>%
+  mutate(Adjusted = Percentage * 0.90) %>%  # 2% of total space = gap
+  ungroup()
+
+plot = ggplot(pct_cluster_by_condition, aes(x = 2, y = Percentage, fill = louvain_pc20_k45_res0.6)) +
+  geom_bar(stat = "identity", width = 0.6, color = "black") +
+  coord_polar(theta = "y") +
+  scale_fill_manual(values = pal_clustering_bis) +
+  xlim(0.5, 2.5) +  # crée le "trou"
+  facet_wrap(~ Multiplexing_Condition) +
+  theme_void() +
+  theme(
+    strip.text = element_text(size = 14, face = "bold"),
+    legend.title = element_blank(),
+    legend.position = "right"
+  ) 
+
+ggsave(
+  plot = plot,
+  filename = paste0(out_path,time_stamp(),"plots_proportion_cluster_per_treatment.pdf"),
+  device = "pdf",
+  width = 6, height = 
+)
+
+
+```
+
+```{r Bar plot (cycle by cluster)}
+
+plot = ggplot(pct_cycle_by_cluster, aes(x = louvain_pc20_k45_res0.6, y = Percentage, fill = cell_cycle_phase)) +
+  geom_bar(stat = "identity", position = "stack", width = 0.6, color = "black") +
+  scale_fill_manual(values = pal_cell_cycle_phase) +
+  theme_minimal() +
+  theme(
+    strip.text = element_text(size = 14, face = "bold"),
+    legend.title = element_blank(),
+    legend.position = "right"
+  ) 
+
+ggsave(
+  plot = plot,
+  filename = paste0(out_path,time_stamp(),"plots_proportion_cell_cycle_per_cluster.pdf"),
+  device = "pdf",
+  width = 5, height = 4
+)
+
+
+```
+
+```{r Bar plot (cycle by cluster) : Fig Supp.}
+
+############
+# Load Day 3 data
+###########
+
+file_path = get_exp_file_path(
+  organ = "Prostate" ,
+  project = "Xenograft_Models",
+  samples_ID = "P20-11_3d_ADT",
+  prev_exp = "9_Signature_Scores",
+  pattern = "sce_obj_scored.rds")
+
+sce_obj_day3 = readRDS(file_path)
+
+md_day3 = colData(sce_obj_day3)
+md_day3 = as_tibble(md_day3)
+
+# Add metadata col to day 3 and day 21 metadata table
+###################################################
+
+md$Day = "Day_21"
+md$Clustering = md$louvain_pc20_k45_res0.6
+md_day3$Day = "Day_3"
+md_day3$Clustering = md_day3$louvain_pc20_k30_res0.5
+
+
+md_day21_day3 = bind_rows(
+  md_day3[,c("Day","Clustering","cell_cycle_phase")],
+  md[,c("Day","Clustering","cell_cycle_phase")]
+  )
+
+md_day21_day3$Day = factor(md_day21_day3$Day, levels = c("Day_3", "Day_21"))
+
+# Plot
+######
+
+plot = ggplot(md_day21_day3, aes(Clustering)) +
+  geom_bar(aes(fill = cell_cycle_phase), position = "fill") + 
+  scale_fill_manual(values = pal_cell_cycle_phase) +
+  theme(
+    strip.text = element_text(size = 14, face = "bold"),
+    legend.title = element_blank(),
+    legend.position = "right"
+  ) +
+  facet_wrap(~Day, scales ="free") + 
+  theme_minimal() +
+  guides(fill = "none")
+  
+
+ggsave(
+  plot = plot,
+  filename = paste0(out_path,time_stamp(),"plots_proportion_cell_cycle_per_cluster_Day3_Day21.pdf"),
+  device = "pdf",
+  width = 7, height = 4
+)
+
+```
+

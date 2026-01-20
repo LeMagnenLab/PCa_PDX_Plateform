@@ -1,0 +1,134 @@
+---
+title: "Comon step 2 : HTO Demux"
+author: "Romuald Parmentier"
+date: "2025-03-11"
+output: html_document
+---
+
+```{r}
+
+### Load Required Libraries
+library(SingleCellExperiment)
+library(Seurat)
+library(stringr)
+library(dplyr)
+library(tidyr)
+library(deMULTIplex2)
+
+### Source Custom Functions
+source("/scicore/home/wykopa75/GROUP/rparmentier/sc_RNAseq/my_R_functions/Xenograft_Models_Custom_Functions.R")
+
+### Define Output Path
+out_path <- create_exp_folder(
+  organ = "Prostate",
+  project = "Xenograft_Models",
+  samples_ID = "Comon_Steps",
+  exp = "2_Demux_All_HTO_samples"
+)
+
+### Define Sample Metadata Mapping
+# Define sample-specific metadata mappings
+sample_mappings <- list(
+  rm02 = c('AA01-MS01' = "noDHT", 'AA02-MS02' = "DHT"),
+  rm04 = c('AA01-MS01' = "noDHT_noENZA", 'AA02-MS02' = "noDHT_ENZA", 'AA03-MS03' = "DHT_noENZA", 'AA04-MS04' = "DHT_ENZA"),
+  rm06 = c('AA01-MS01' = "noDHT_noENZA", 'AA02-MS02' = "noDHT_ENZA", 'AA03-MS03' = "DHT_noENZA", 'AA04-MS04' = "DHT_ENZA"),
+  rp02 = c('AA01-MS01' = "CTRL", 'AA02-MS02' = "Medium_05"),
+  rp16 = c('AA01-MS01' = "P20-11_PDOXA_P3", 'AA02-MS02' = "P20-11_PDOXA_P3", 'AA03-MS03' = "P20-11_PDOXB_P3", 'AA04-MS04' = "P20-11_PDOXB_P3"),
+  rp27 = c('AA01-MS01' = "CTRL", 'AA02-MS02' = "Capivasertib")
+)
+
+```
+
+```{r}
+
+# Initialize list to store SingleCellExperiment objects and summary tables
+list_sce <- list()
+summary_list <- list()
+
+# Process each sample
+for (sample_id in names(sample_mappings)) {
+  
+  cat("\nProcessing sample:", sample_id, "\n")
+  
+  # Load sample-specific SCE object
+  sce_path <- paste0(
+    "/scicore/home/wykopa75/GROUP/rparmentier/sc_RNAseq/Projects/Prostate/Xenograft_Models/bin/Comon_Steps/0_Comon_STARSolo_Preprocessing/results/empty_drops/",
+    sample_id, 
+    "/hg38_ensdb_110_sce.rds")
+  
+  sce_obj <- readRDS(sce_path)
+  
+  # Convert to Seurat object
+  main_seurat <- as.Seurat(
+    x = sce_obj,
+    counts = "counts",
+    data = NULL,
+    project = sample_id
+  )
+  
+  # Normalize HTO data
+  main_seurat_hto <- NormalizeData(main_seurat, assay = "HTO", normalization.method = "CLR")
+  
+  # Perform demultiplexing
+  DefaultAssay(main_seurat) <- "HTO"
+  bar.table <- t(as.matrix(GetAssayData(main_seurat, slot = "counts")))
+  demux_res <- demultiplexTags(bar.table, plot.path = out_path, plot.name = paste0("deMULTIplex2_", sample_id), plot.diagnostics = TRUE)
+  
+  # Assign demultiplexing results
+  sce_obj$ident.demultiplex2 <- "negative"
+  sce_obj$ident.demultiplex2[which(colnames(sce_obj) %in% names(demux_res$final_assign))] <- demux_res$final_assign
+  
+  # Create metadata
+  sample_mapping <- sample_mappings[[sample_id]]
+  
+  metadata <- tibble(demux_res = sce_obj$ident.demultiplex2) %>%
+    mutate(
+      Multiplexing_Condition = case_when(
+        demux_res %in% names(sample_mapping) ~ sample_mapping[demux_res],
+        TRUE ~ "Undefined"
+      ),
+      Multiplet_Class = case_when(
+        demux_res == "multiplet" ~ "Multiplet",
+        demux_res == "negative" ~ "Negative",
+        demux_res %in% names(sample_mapping) ~ "Singlet",
+        TRUE ~ "Multiplet"
+      )
+    )
+  
+  # Assign to SCE object
+  sce_obj$Multiplexing_Condition <- metadata$Multiplexing_Condition
+  sce_obj$Multiplet_Class <- metadata$Multiplet_Class
+  
+  # Make a Clean Id for each sample
+  sce_obj$Clean_ID = paste0(sce_obj$Model_ID,"_", sce_obj$Model_Mouse, "_", sce_obj$Model_Passage, "_", sce_obj$Model_System)
+  
+  # Generate summary table
+  summary_table <- metadata %>% 
+    group_by(Multiplexing_Condition) %>% 
+    summarise(Count = n()) %>%
+    mutate(Sample_ID = sample_id, Sample_Group = unique(sce_obj$SampleGroup))
+  
+  # Print summary
+  print(summary_table)
+  
+  # Store results
+  list_sce[[sample_id]] <- sce_obj
+  summary_list[[sample_id]] <- summary_table
+  
+  # Save SCE object
+  saveRDS(object = sce_obj, file = paste0(out_path, time_stamp(), "_", sample_id, "_sce_obj_hto_demux.rds"))
+}
+
+# Combine all summary tables and save as CSV
+final_summary <- bind_rows(summary_list)
+
+```
+
+# Export the outpus
+
+```{r}
+
+write.csv(final_summary, file = paste0(out_path, "final_summary_demux.csv"), row.names = FALSE)
+saveRDS(object = list_sce, file = paste0(out_path, "list_sce_demux.rds"))
+
+```

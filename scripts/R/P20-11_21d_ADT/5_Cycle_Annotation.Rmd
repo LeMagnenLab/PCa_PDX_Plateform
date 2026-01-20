@@ -1,0 +1,85 @@
+---
+title: "P20-11 ADT (Only) treated (21 Days): cycle annotation"
+author: "Romuald Parmentier"
+date: "2025-06-06"
+output: html_document
+---
+
+```{r Prepare environment, message = F}
+
+# Libraries
+library(Seurat)
+library(SingleCellExperiment)
+library(ggplot2)
+library(dplyr)
+
+# Functions and palettes
+source("/scicore/home/wykopa75/GROUP/rparmentier/sc_RNAseq/my_R_functions/Xenograft_Models_Custom_Functions.R")
+
+# Create output path (adapted)
+out_path = create_exp_folder(
+  organ = "Prostate",
+  project = "Xenograft_Models",
+  samples_ID = "P20-11_21d_ADT",
+  exp = "5_Cycle_Annotation"
+)
+
+```
+
+# Prepare the data
+
+```{r Load the files}
+
+# Load list of sce_obj after intra-sample normalization (no rescaling)
+file_path = get_exp_file_path(
+  organ = "Prostate",
+  project = "Xenograft_Models",
+  samples_ID = "P20-11_21d_ADT",
+  prev_exp = "4_Normalization", 
+  pattern = "sce_obj_normalized.rds") # Internally normalized samples for cycle annotation
+
+sce_obj = readRDS(file = file_path) 
+
+```
+
+# Cell cycle assignation 
+
+Done according standard seurat_obj procedure
+
+```{r Cell cycle phase annotation}
+
+# Transform sce_obj object in seurat_obj object
+seurat_obj = as.Seurat(
+  x = sce_obj,
+  counts = "counts",
+  data = NULL
+)
+
+DefaultAssay(object = seurat_obj) = "originalexp"
+seurat_obj <- NormalizeData(seurat_obj, normalization.method = "LogNormalize", scale.factor = 10000)
+seurat_obj <- ScaleData(seurat_obj)
+
+# Store cell cycles-associated genes in variables
+s.genes <- cc.genes.updated.2019$s.genes
+g2m.genes <- cc.genes.updated.2019$g2m.genes
+
+# Compute the cell cycle signature score
+seurat_obj <- CellCycleScoring(seurat_obj, s.features = s.genes, g2m.features = g2m.genes, set.ident = TRUE)
+
+# Add cell cycle phase to the sce_obj object
+sce_obj$cell_cycle_phase = seurat_obj$Phase
+
+print(table(sce_obj$cell_cycle_phase))
+
+```
+
+# Export files
+
+```{r export the objects}
+
+# Export annotated sce_obj object
+saveRDS(
+  object = sce_obj,
+  file = paste0(out_path,time_stamp(), "sce_obj_cycle_annotated.rds"))
+
+```

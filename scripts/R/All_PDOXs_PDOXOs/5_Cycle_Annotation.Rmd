@@ -1,0 +1,100 @@
+---
+title: "5. PDOX and PDOXO (P20-11 & P20-23) : Cycle annotation"
+author: "Romuald Parmentier"
+date: "2025-04-01"
+output: html_document
+---
+
+```{r Prepare environment, message = F}
+
+# Libraries
+library(Seurat)
+library(SingleCellExperiment)
+library(ggplot2)
+library(dplyr)
+
+# Functions and palettes
+source("/scicore/home/wykopa75/GROUP/rparmentier/sc_RNAseq/my_R_functions/Xenograft_Models_Custom_Functions.R")
+
+# Create output path (adapted)
+out_path = create_exp_folder(
+  organ = "Prostate",
+  project = "Xenograft_Models",
+  samples_ID = "All_PDOXs_PDOXOs",
+  exp = "5_Cycle_Annotation"
+)
+
+```
+
+# Prepare the data
+
+```{r Load the files}
+
+# Load list of sce after intra-sample normalization (no rescaling)
+file_path = get_exp_file_path(
+  organ = "Prostate",
+  project = "Xenograft_Models",
+  prev_exp = "All_PDOXs_PDOXOs/4_Normalization_Rescaling", 
+  pattern = "list_sce_normalized.rds") # Internally normalized samples for cycle annotation
+
+list_sce = readRDS(file = file_path) 
+
+```
+
+# Cell cycle assignation 
+
+Done according standard Seurat procedure
+
+```{r Cell cycle phase annotation}
+
+sce_id = 1
+
+for(sce in list_sce){ 
+  
+  name = names(list_sce)[[sce_id]]
+  
+  # Transform sce object in seurat object
+  seurat = as.Seurat(
+    x = sce,
+    counts = "counts",
+    data = NULL
+  )
+  
+  DefaultAssay(object = seurat) = "originalexp"
+  seurat <- NormalizeData(seurat, normalization.method = "LogNormalize", scale.factor = 10000)
+  seurat <- ScaleData(seurat)
+  
+  # Store cell cycles-associated genes in variables
+  s.genes <- cc.genes.updated.2019$s.genes
+  g2m.genes <- cc.genes.updated.2019$g2m.genes
+  
+  # Compute the cell cycle signature score
+  seurat <- CellCycleScoring(seurat, s.features = s.genes, g2m.features = g2m.genes, set.ident = TRUE)
+  
+  # Add cell cycle phase to the sce object
+  sce$cell_cycle_phase = seurat$Phase
+  
+  # Print cell cycles phases stats
+  cat(paste0("Sample: ", name))
+  
+  print(table(sce$cell_cycle_phase))
+
+# Add marked object to a lst
+list_sce[[name]] = sce
+
+sce_id = sce_id + 1
+
+}
+
+```
+
+# Export files
+
+```{r export the objects}
+
+# Export annotated sce object
+saveRDS(
+  object = list_sce,
+  file = paste0(out_path,time_stamp(), "list_sce_cycle_annotated.rds"))
+
+```

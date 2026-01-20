@@ -1,0 +1,86 @@
+---
+title: "P20-11 ADT (only) treated (21 Days) : normalization"
+author: "Romuald Parmentier"
+date: "2025-06-06"
+output: html_document
+---
+
+```{r Prepare environment, message = F}
+
+# Libraries
+library(Seurat)
+library(SingleCellExperiment)
+library(scran)
+library(stringr)
+library(dplyr)
+library(tibble)
+library(ggplot2)
+
+# Functions and palettes
+source("/scicore/home/wykopa75/GROUP/rparmentier/sc_RNAseq/my_R_functions/Xenograft_Models_Custom_Functions.R")
+
+# Create output path (adapted)
+out_path = create_exp_folder(
+  organ = "Prostate",
+  project = "Xenograft_Models",
+  samples_ID = "P20-11_21d_ADT",
+  exp = "4_Normalization"
+)
+
+```
+
+```{r Load list of sce_obj after QC}
+
+# Load sce_obj object after quality control (adapted)
+file_path = get_exp_file_path(
+  organ = "Prostate",
+  project = "Xenograft_Models",
+  samples_ID = "Comon_Steps",
+  prev_exp = "3_QC_HTO_and_Non_HTO_Samples", 
+  pattern = "list_sce_flag_qc.rds")
+
+list_sce_obj = readRDS(file = file_path) 
+sample_names = names(list_sce_obj)
+
+```
+
+# Prepare the data
+
+```{r Filter PDO samples}
+
+# Select only P20-11 ADT 21days
+sce_obj = list_sce_obj$rm06
+
+sce_obj = sce_obj[,which(sce_obj$Multiplexing_Condition %in% c("DHT_noENZA","noDHT_noENZA"))]
+
+# Remove cells flagged asbad quality cells
+sce_obj = sce_obj[, which(sce_obj$qc_discarded == F)]
+
+```
+
+# Normalization
+
+```{r Cluster based normalization}
+
+set.seed(100)
+min.size = 200  
+
+# Identify clusters of similar cells to stabilize size factor estimation
+clust.sce_obj = quickCluster(sce_obj, min.size = min.size)
+
+# Compute size factors using deconvolution method within clusters
+sce_obj <- computeSumFactors(sce_obj, clusters = clust.sce_obj)
+
+# Log-normalize counts using the estimated size factors
+sce_obj_normed <- logNormCounts(sce_obj, size.factors = sce_obj$sizeFactor)
+
+```
+
+```{r}
+
+saveRDS(
+  object = sce_obj_normed,
+  file = paste0(out_path,time_stamp(), "sce_obj_normalized.rds"))
+
+```
+

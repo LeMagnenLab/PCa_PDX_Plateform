@@ -1,0 +1,215 @@
+---
+title: "8.P20-11 ADT+ENZ treated (3 Days): differential expression"
+author: "Romuald Parmentier"
+date: "2025-06-10"
+output: html_document
+---
+
+```{r Prepare environment, message = F}
+
+# Libraries
+library(Seurat)
+library(SingleCellExperiment)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(ComplexHeatmap)
+library(ggrepel)
+
+# Functions and palettes
+source("/scicore/home/wykopa75/GROUP/rparmentier/sc_RNAseq/Projects/Prostate/Xenograft_Models/Xenograft_Models_Custom_Functions.R")
+source("/scicore/home/wykopa75/GROUP/rparmentier/sc_RNAseq/Projects/Prostate/Xenograft_Models/Xenograft_Models_Color_Palettes.R")
+
+# Create output path
+out_path = create_exp_folder(
+  organ = "Prostate" ,
+  project = "Xenograft_Models",
+  samples_ID = "P20-11_3d_ADT_ENZ",
+  exp = "8_Differential_Expression"
+)
+
+```
+
+# Prepare the data
+
+```{r Load the files}
+
+file_path = get_exp_file_path(
+  organ = "Prostate",
+  project = "Xenograft_Models",
+  samples_ID = "P20-11_3d_ADT_ENZ",
+  prev_exp = "7_Clustering",
+  pattern = "sce_obj_clustered.rds") 
+
+sce_obj = readRDS(file = file_path)
+
+```
+
+```{r Transform sce to Seurat object}
+
+seurat_obj = as.Seurat(
+  x = sce_obj, 
+  counts = "counts", 
+  data = "logcounts"
+)
+
+# Set the originalexp (aka "RNA" as the default assay)
+DefaultAssay(seurat_obj) = "originalexp"
+
+# Adds scale.data slot
+seurat_obj = ScaleData(seurat_obj)
+
+```
+
+# Differential expression and visualisation
+
+## Perform DE between Walktrap Clusters
+----------------------------------------
+
+```{r Seurat FindAllMarkers between walktrap 15}
+
+Idents(seurat_obj) = "walktrap_15"
+
+Cluster_Main_Markers_walktrap_15 <- 
+  FindAllMarkers(
+    seurat_obj,
+    slot = "data",
+    only.pos = T, # True gives only upregulated genes in each cluster against all the others
+    min.pct = 0.5, # Minimum pct of cells expressing the gene in either of the two pop
+    logfc.threshold = 0.5, # Limit testing to genes which show, on average, at least X-fold difference (default)
+    test.use = "MAST")
+
+
+# Export the list of genes in seurat and csv
+
+write.csv(
+  x = Cluster_Main_Markers_walktrap_15,
+  file = paste0(out_path, time_stamp(),"DE_Table_All_Clusters_walktrap_15.csv"))
+
+```
+
+# Visualization
+
+```{r}
+
+file_path = get_exp_file_path(
+  organ = "Prostate",
+  project = "Xenograft_Models",
+  samples_ID = "P20-11_3d_ADT_ENZ",
+  prev_exp = "8_Differential_Expression",
+  pattern = "DE_Table_All_Clusters_walktrap_15.csv") 
+
+Cluster_Main_Markers_walktrap_15 = read.csv(file = file_path)
+
+```
+
+```{r Heatmap of cluster main markers walktrap 15}
+
+#################
+### Prepare data
+#################
+
+DE_genes_selection <- Cluster_Main_Markers_walktrap_15 %>%
+  filter(abs(avg_log2FC) >= 1.5 & p_val_adj < 1e-20) %>%  
+  group_by(cluster) %>%
+  arrange(desc(avg_log2FC)) %>%
+  slice_head(n = 20) %>%
+  ungroup() %>% # Needed otherwise in the next ytep, the distinct function will work on groups (and thus miss repeated features)
+  distinct(gene, .keep_all = T) %>%
+  pull(gene)
+
+# Flag DHT vs noDHT cells (indpendan fron Enza) for clarity
+sce_obj$DHT_Status = ifelse(
+  test = grepl(x = sce_obj$Multiplexing_Condition, pattern = "noDHT"),
+  yes = "noDHT" , 
+  no = "DHT"
+)
+
+md = as_tibble(colData(sce_obj))
+
+###############
+## Reorder the object
+###################
+
+# Example: sort by metadata column "cluster"
+ordered_indices <- order(sce_obj$walktrap_15, sce_obj$DHT_Status, sce_obj$Multiplexing_Condition )
+
+# Reorder columns (cells) of the SCE object
+sce_obj <- sce_obj[, ordered_indices]
+
+seurat_obj = as.Seurat(
+  x = sce_obj, 
+  counts = "counts", 
+  data = "logcounts"
+)
+
+# Set the originalexp (aka "RNA" as the default assay)
+DefaultAssay(seurat_obj) = "originalexp"
+
+# Adds scale.data slot
+seurat_obj = ScaleData(seurat_obj)
+
+# Extract scaled data
+seurat_obj_data_mtx <- GetAssayData(seurat_obj, assay = "originalexp", layer = "scale.data")[DE_genes_selection, ] %>% as.matrix() 
+
+#############
+### Heatmap #
+#############
+
+heatmap_anno = HeatmapAnnotation(
+  Clusters = factor(sce_obj$walktrap_15, levels = unique(sce_obj$walktrap_15)), # Has to be a factor
+  DHT_Status = factor(sce_obj$DHT_Status, levels = unique(sce_obj$DHT_Status)),
+  Condition = factor(sce_obj$Multiplexing_Condition, levels = unique(sce_obj$Multiplexing_Condition)),
+  col = list(
+    Clusters = pal_walktrap_cluster,
+    DHT_Status = pal.dht.status,
+    Condition = pal.treatment),
+  show_legend = c(Clusters = F, Conditions = T, DHT_Status = T ), 
+  show_annotation_name = T)
+
+
+h1 = Heatmap( 
+  top_annotation = heatmap_anno,
+  matrix = seurat_obj_data_mtx,
+  cluster_rows = F,
+  cluster_column_slices = T,
+  cluster_columns = F, # If TRUE it will try to cluster cells
+  column_split = seurat_obj$walktrap_15, # Will seperate clusters
+  show_column_dend = F, # If a dend has been provided in cluster_columns then it will use this one, otherwise, makes a new one.
+  show_column_names = F, # This will make cell names appear in this case (should remain F)
+  show_row_dend = F,
+  use_raster = TRUE,
+  width = unit(7, "inch"),  # reduce width for padding
+  height = unit(7, "inch"),  # reduce width for padding
+  col_fun <- circlize::colorRamp2(
+    breaks = c(-4, 0, 4),  
+    colors = c("darkblue", "white", "darkred")),    
+  row_names_gp = grid::gpar(fontsize = 4),
+  heatmap_legend_param = list(
+    title = "log2(UMI_count)",
+    direction = "horizontal",
+    title_position = "topcenter",
+    legend_direction = "horizontal",
+    legend_width = unit(4, "cm")
+  )
+)
+
+
+pdf(
+  file = paste0(out_path,time_stamp(),"plot_Heatmap_top5genes_walktrap_15.pdf"),
+  width = 9, height = 9.5)
+
+draw(
+  object = h1,
+  heatmap_legend_side = "bottom",
+  annotation_legend_side = "bottom",
+  column_title= "Top 20 DE genes",
+  column_title_gp=grid::gpar(fontsize = 16),
+  merge_legend = TRUE
+)
+
+dev.off()
+
+
+
+```

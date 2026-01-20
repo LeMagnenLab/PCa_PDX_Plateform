@@ -1,0 +1,629 @@
+---
+title: "8.P20-11 ADT+ENZ treated (21 Days): differential expression"
+author: "Romuald Parmentier"
+date: "2025-06-10"
+output: html_document
+---
+
+```{r Prepare environment, message = F}
+
+# Libraries
+library(Seurat)
+library(SingleCellExperiment)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(ComplexHeatmap)
+library(ggrepel)
+
+# Functions and palettes
+source("/scicore/home/wykopa75/GROUP/rparmentier/sc_RNAseq/Projects/Prostate/Xenograft_Models/Xenograft_Models_Custom_Functions.R")
+source("/scicore/home/wykopa75/GROUP/rparmentier/sc_RNAseq/Projects/Prostate/Xenograft_Models/Xenograft_Models_Color_Palettes.R")
+
+# Create output path
+out_path = create_exp_folder(
+  organ = "Prostate" ,
+  project = "Xenograft_Models",
+  samples_ID = "P20-11_21d_ADT_ENZ",
+  exp = "8_Differential_Expression"
+)
+
+```
+
+# Prepare the data
+
+```{r Load the files}
+
+file_path = get_exp_file_path(
+  organ = "Prostate",
+  project = "Xenograft_Models",
+  samples_ID = "P20-11_21d_ADT_ENZ",
+  prev_exp = "7_Clustering",
+  pattern = "sce_obj_clustered.rds") 
+
+sce_obj = readRDS(file = file_path)
+
+```
+
+```{r Transform sce to Seurat object}
+
+seurat_obj = as.Seurat(
+  x = sce_obj, 
+  counts = "counts", 
+  data = "logcounts"
+)
+
+# Set the originalexp (aka "RNA" as the default assay)
+DefaultAssay(seurat_obj) = "originalexp"
+
+# Adds scale.data slot
+seurat_obj = ScaleData(seurat_obj)
+
+```
+
+# Differential expression and visualisation
+
+## Perform DE between Walktrap Clusters
+----------------------------------------
+
+```{r Seurat FindAllMarkers between walktrap 75}
+
+Idents(seurat_obj) = "walktrap_75"
+
+Cluster_Main_Markers_walktrap_75 <- 
+  FindAllMarkers(
+    seurat_obj,
+    slot = "data",
+    only.pos = T, # True gives only upregulated genes in each cluster against all the others
+    min.pct = 0.5, # Minimum pct of cells expressing the gene in either of the two pop
+    logfc.threshold = 0.5, # Limit testing to genes which show, on average, at least X-fold difference (default)
+    test.use = "MAST")
+
+
+# Export the list of genes in seurat and csv
+
+write.csv(
+  x = Cluster_Main_Markers_walktrap_75,
+  file = paste0(out_path, time_stamp(),"DE_Table_All_Clusters_walktrap_75.csv"))
+
+```
+
+
+```{r Reload DE results}
+
+file_path = get_exp_file_path(
+  organ = "Prostate",
+  project = "Xenograft_Models",
+  samples_ID = "P20-11_21d_ADT_ENZ",
+  prev_exp = "8_Differential_Expression",
+  pattern = "DE_Table_All_Clusters_walktrap_75.csv")
+
+Cluster_Main_Markers_walktrap_75 = read.csv(file_path)
+
+```
+
+
+### Heatmap visualization
+
+```{r Make heatmap DHT Treatment}
+
+# Flag DHT vs noDHT cells (indpendan fron Enza) for clarity
+sce_obj$DHT_Status = ifelse(
+  test = grepl(x = sce_obj$Multiplexing_Condition, pattern = "noDHT"),
+  yes = "noDHT" , 
+  no = "DHT"
+)
+
+heatmap_anno = HeatmapAnnotation(
+  Clusters = factor(sce_obj$walktrap_75, levels = unique(sce_obj$walktrap_75)), # Has to be a factor
+  Condition = factor(sce_obj$Multiplexing_Condition, levels = unique(sce_obj$Multiplexing_Condition)),
+  DHT_Status = factor(sce_obj$DHT_Status, levels = unique(sce_obj$DHT_Status)),
+  col = list(
+    Clusters = pal_walktrap_cluster,
+    Condition = pal.treatment,
+    DHT_Status = pal.dht.status),  
+  show_legend = c(Clusters = T, Conditions = T, DHT_Status = T), 
+  show_annotation_name = T)
+
+{
+  
+  pdf(
+    file = paste0(out_path,time_stamp(),"plot_Heatmap_top5genes_walktrap_75.pdf"),
+    width = 12, height = 8)
+  
+  print(Heatmap( 
+    top_annotation = heatmap_anno,
+    matrix = seurat_obj_data_mtx,
+    cluster_rows = F,
+    cluster_column_slices = T,
+    cluster_columns = T, # If TRUE it will try to cluster cells
+    column_split = sce_obj$walktrap_75, # Will seperate clusters
+    show_column_dend = F, # If a dend has been provided in cluster_columns then it will use this one, otherwise, makes a new one.
+    show_column_names = F, # This will make cell names appear in this case (should remain F)
+    show_row_dend = F,
+    use_raster = TRUE,
+    col = c("lightgrey",rev(paletteer_c("viridis::magma", 30))), # or col = c("grey", rev(paletteer_c("viridis::inferno", 30))),
+    row_names_gp = grid::gpar(fontsize = 5),
+    heatmap_legend_param = list(title = "log2(UMI_count)")
+  ))
+  
+  dev.off()
+  
+}
+
+```
+
+```{r Heatmap of cluster main markers}
+
+#################
+### Prepare data
+#################
+
+DE_genes_selection <- Cluster_Main_Markers_walktrap_75 %>%
+  filter(abs(avg_log2FC) >= 1.5 & p_val_adj < 1e-20) %>%  
+  group_by(cluster) %>%
+  arrange(desc(avg_log2FC)) %>%
+  slice_head(n = 20) %>%
+  ungroup() %>% # Needed otherwise in the next ytep, the distinct function will work on groups (and thus miss repeated features)
+  distinct(gene, .keep_all = T) %>%
+  pull(gene)
+
+
+# Flag DHT vs noDHT cells (indpendan fron Enza) for clarity
+sce_obj$DHT_Status = ifelse(
+  test = grepl(x = sce_obj$Multiplexing_Condition, pattern = "noDHT"),
+  yes = "noDHT" , 
+  no = "DHT"
+)
+
+md = as_tibble(colData(sce_obj))
+
+###############
+## Reorder the object
+###################
+
+# Example: sort by metadata column "cluster"
+ordered_indices <- order(sce_obj$walktrap_75, sce_obj$DHT_Status, sce_obj$Multiplexing_Condition )
+
+# Reorder columns (cells) of the SCE object
+sce_obj <- sce_obj[, ordered_indices]
+
+seurat_obj = as.Seurat(
+  x = sce_obj, 
+  counts = "counts", 
+  data = "logcounts"
+)
+
+# Set the originalexp (aka "RNA" as the default assay)
+DefaultAssay(seurat_obj) = "originalexp"
+
+# Adds scale.data slot
+seurat_obj = ScaleData(seurat_obj)
+
+# Extract scaled data
+seurat_obj_data_mtx <- GetAssayData(seurat_obj, assay = "originalexp", layer = "scale.data")[DE_genes_selection, ] %>% as.matrix() 
+
+
+#############
+### Heatmap #
+#############
+
+heatmap_anno = HeatmapAnnotation(
+  Clusters = factor(sce_obj$walktrap_75, levels = unique(sce_obj$walktrap_75)), # Has to be a factor
+  Condition = factor(sce_obj$Multiplexing_Condition, levels = unique(sce_obj$Multiplexing_Condition)),
+  col = list(
+    Clusters = pal_walktrap_cluster,
+    Condition = pal.treatment,
+    DHT_Status = pal.dht.status),  
+  show_legend = c(Clusters = F, Conditions = T), 
+  show_annotation_name = T)
+
+
+h1 = Heatmap( 
+  top_annotation = heatmap_anno,
+  matrix = seurat_obj_data_mtx,
+  cluster_rows = F,
+  cluster_column_slices = F,
+  cluster_columns = F, # If TRUE it will try to cluster cells
+  column_split = seurat_obj$walktrap_75, # Will seperate clusters
+  show_column_dend = F, # If a dend has been provided in cluster_columns then it will use this one, otherwise, makes a new one.
+  show_column_names = F, # This will make cell names appear in this case (should remain F)
+  show_row_dend = F,
+  use_raster = TRUE,
+  width = unit(7, "inch"),  # reduce width for padding
+  height = unit(7, "inch"),  # reduce width for padding
+  col_fun <- circlize::colorRamp2(
+    breaks = c(-4, 0, 4),  
+    colors = c("darkblue", "white", "darkred")),    
+  row_names_gp = grid::gpar(fontsize = 5),
+  heatmap_legend_param = list(
+    title = "log2(UMI_count)",
+    direction = "horizontal",
+    title_position = "topcenter",
+    legend_direction = "horizontal",
+    legend_width = unit(4, "cm")
+  )
+)
+
+
+pdf(
+  file = paste0(out_path,time_stamp(),"plot_Heatmap_top5genes_walktrap_75.pdf"),
+  width = 9, height = 9.5)
+
+draw(
+  object = h1,
+  heatmap_legend_side = "bottom",
+  annotation_legend_side = "bottom",
+  column_title= "Top 20 DE genes",
+  column_title_gp=grid::gpar(fontsize = 16),
+  merge_legend = TRUE
+)
+
+dev.off()
+
+
+
+```
+
+#### To be deleted : custom Heatmap for Roche
+
+```{r Define Roche Gene Sets}
+
+Roche_Gene_Sets_df = tibble(
+  gene = c("PRKDC", "XRCC6", "XRCC2","XRCC3","RAD54B","RAD51C","POLE2","MAD2L1","FANCI","RFC3","POLA2","RAD54B","MCM7","RFC4","RAD18","RAD51C","CHEK1","POLA1","FANCC","CCNH","MRE11","MSH6","RAD21","XRCC4","PARP1","ATR","USP1","RFC1","HUS1","MSH2","XRCC5","LIG3","NBN","DLX5","ALKBH1","TDP1","WRN","TOPBP1","CHEK1","BRCA1", "BRCA2","ATM","EXO1","BLM","RMI1","RAD54L","LIG1","XRCC3","RMI2"),
+  term = rep("Roche_Gene_Set", 49 )
+)
+
+```
+
+```{r Prepare expresison data for ggplot2}
+
+# Extraire les données d'expression normalisées
+seurat_obj_data_mtx <- GetAssayData(seurat_obj, assay = "originalexp", layer = "data")[Roche_Gene_Sets_df$gene, ] %>% as.matrix() 
+
+seurat_obj_data_tibble = as_tibble(seurat_obj_data_mtx,rownames = "feature")
+
+# Ajouter la colonne des groupes d'identité
+meta_data <- seurat_obj@meta.data %>% 
+  dplyr::select("Multiplexing_Condition") %>% 
+  tibble::rownames_to_column("cell")
+
+seurat_obj_data_tibble_long <- seurat_obj_data_tibble %>% 
+  pivot_longer(cols = -feature, names_to = "cell", values_to = "expression") %>%
+  left_join(meta_data, by = "cell") %>%
+  rename(group = "Multiplexing_Condition")
+
+# Calculer les moyennes et pourcentages d'expression
+dotplot_data <- seurat_obj_data_tibble_long %>%
+  group_by(feature, group) %>%
+  summarize(
+    avg_expression = mean(expression),
+    percent_expression = mean(expression > 0) * 100,
+    .groups = "drop"
+  ) %>%
+  group_by(feature) %>%
+  mutate(
+    avg_expression_feature = mean(avg_expression)
+  )
+
+sorted_features <- dotplot_data %>%
+  distinct(feature, avg_expression_feature) %>%
+  arrange(desc(avg_expression_feature)) %>%
+  pull(feature)
+
+seurat_obj_data_mtx_roche = seurat_obj_data_mtx[sorted_features,]
+
+```
+
+```{r Heatmap Roche Gene Set}
+
+# Flag DHT vs noDHT cells (indpendan fron Enza) for clarity
+sce_obj$DHT_Status = ifelse(
+  test = grepl(x = sce_obj$Multiplexing_Condition, pattern = "noDHT"),
+  yes = "noDHT" , 
+  no = "DHT"
+)
+
+heatmap_anno = HeatmapAnnotation(
+  Condition = factor(sce_obj$Multiplexing_Condition, levels = unique(sce_obj$Multiplexing_Condition)),
+  DHT_Status = factor(sce_obj$DHT_Status, levels = unique(sce_obj$DHT_Status)),
+  col = list(
+    Condition = pal.treatment,
+    DHT_Status = pal.dht.status),  
+  show_legend = c(Conditions = T, DHT_Status = T), 
+  show_annotation_name = T)
+
+{
+  
+  pdf(
+    file = paste0(out_path,time_stamp(),"plot_Heatmap_Roche_Gene_Set.pdf"),
+    width = 12, height = 8)
+  
+  print(Heatmap( 
+    top_annotation = heatmap_anno,
+    matrix = seurat_obj_data_mtx_roche,
+    cluster_rows = F,
+    cluster_column_slices = T,
+    cluster_columns = T, # If TRUE it will try to cluster cells
+    column_split = sce_obj$Multiplexing_Condition, # Will seperate clusters
+    show_column_dend = F, # If a dend has been provided in cluster_columns then it will use this one, otherwise, makes a new one.
+    show_column_names = F, # This will make cell names appear in this case (should remain F)
+    show_row_dend = F,
+    use_raster = TRUE,
+    col = c("lightgrey",rev(paletteer_c("viridis::magma", 30))), # or col = c("grey", rev(paletteer_c("viridis::inferno", 30))),
+    row_names_gp = grid::gpar(fontsize = 5),
+    heatmap_legend_param = list(title = "log2(UMI_count)")
+  ))
+  
+  dev.off()
+  
+}
+```
+
+# Scaled hjeatmaü
+
+```{r Prepare expresison data for ggplot2}
+
+# Extraire les données d'expression normalisées
+seurat_obj_data_mtx <- GetAssayData(seurat_obj, assay = "originalexp", layer = "scale.data")[Roche_Gene_Sets_df$gene, ] %>% as.matrix() 
+
+seurat_obj_data_tibble = as_tibble(seurat_obj_data_mtx,rownames = "feature")
+
+# Ajouter la colonne des groupes d'identité
+meta_data <- seurat_obj@meta.data %>% 
+  dplyr::select("Multiplexing_Condition") %>% 
+  tibble::rownames_to_column("cell")
+
+seurat_obj_data_tibble_long <- seurat_obj_data_tibble %>% 
+  pivot_longer(cols = -feature, names_to = "cell", values_to = "expression") %>%
+  left_join(meta_data, by = "cell") %>%
+  rename(group = "Multiplexing_Condition")
+
+# Calculer les moyennes et pourcentages d'expression
+dotplot_data <- seurat_obj_data_tibble_long %>%
+  group_by(feature, group) %>%
+  summarize(
+    avg_expression = mean(expression),
+    percent_expression = mean(expression > 0) * 100,
+    .groups = "drop"
+  ) %>%
+  group_by(feature) %>%
+  mutate(
+    avg_expression_feature = mean(avg_expression)
+  )
+
+sorted_features <- dotplot_data %>%
+  distinct(feature, avg_expression_feature) %>%
+  arrange(desc(avg_expression_feature)) %>%
+  pull(feature)
+
+seurat_obj_data_mtx_roche = seurat_obj_data_mtx[sorted_features,]
+
+```
+
+```{r Heatmap Roche Gene Set}
+
+# Flag DHT vs noDHT cells (indpendan fron Enza) for clarity
+sce_obj$DHT_Status = ifelse(
+  test = grepl(x = sce_obj$Multiplexing_Condition, pattern = "noDHT"),
+  yes = "noDHT" , 
+  no = "DHT"
+)
+
+heatmap_anno = HeatmapAnnotation(
+  Condition = factor(sce_obj$Multiplexing_Condition, levels = unique(sce_obj$Multiplexing_Condition)),
+  DHT_Status = factor(sce_obj$DHT_Status, levels = unique(sce_obj$DHT_Status)),
+  col = list(
+    Condition = pal.treatment,
+    DHT_Status = pal.dht.status),  
+  show_legend = c(Conditions = T, DHT_Status = T), 
+  show_annotation_name = T)
+
+{
+  
+  pdf(
+    file = paste0(out_path,time_stamp(),"plot_Heatmap_Roche_Gene_Set_SCALED.pdf"),
+    width = 12, height = 8)
+  
+  print(Heatmap( 
+    top_annotation = heatmap_anno,
+    matrix = seurat_obj_data_mtx_roche,
+    cluster_rows = F,
+    cluster_column_slices = T,
+    cluster_columns = T, # If TRUE it will try to cluster cells
+    column_split = sce_obj$Multiplexing_Condition, # Will seperate clusters
+    show_column_dend = F, # If a dend has been provided in cluster_columns then it will use this one, otherwise, makes a new one.
+    show_column_names = F, # This will make cell names appear in this case (should remain F)
+    show_row_dend = F,
+    use_raster = TRUE,
+    col_fun <- circlize::colorRamp2(
+      breaks = c(-3, 0, 8),  # ou plus symétrique : c(-3, 0, 3) selon la distribution
+      colors = c("darkblue", "white", "darkred")
+    ),
+    heatmap_legend_param = list(title = "z-scores")
+  ))
+  
+  dev.off()
+  
+}
+```
+
+
+## Perform DE between tratments
+--------------------------------
+
+```{r Seurat FindAllMarkers between treatments}
+
+Idents(seurat_obj) = "Multiplexing_Condition"
+
+comparison_list = list(
+  "ADT_Effect" = c("DHT_noENZA","noDHT_noENZA"),
+  "Enzalutamide_Effect" = c("DHT_noENZA","DHT_ENZA"),
+  "Enzalutamide_ADT_Effect"= c("noDHT_noENZA","noDHT_ENZA")
+)
+
+for(treatment in seq_along(comparison_list)){
+  
+  treatment_name = names(comparison_list)[treatment]
+  treatment_groups = comparison_list[[treatment]]
+  
+  DE_genes <- 
+    FindMarkers(
+      object = seurat_obj,
+      ident.1 = treatment_groups[1], #CTRL
+      ident.2 = treatment_groups[2] , #Tested
+      slot = "data",
+      only.pos = F, # True gives only upregulated genes in each cluster against all the others
+      min.pct = 0.5, # Minimum pct of cells expressing the gene in either of the two pop
+      logfc.threshold = 0, # Limit testing to genes which show, on average, at least X-fold difference (default)
+      test.use = "wilcox") # Also tried with MAST
+  
+  DE_genes = as_tibble(DE_genes,rownames = "gene")
+  
+  # Export the list of genes in seurat and csv
+  saveRDS(
+    object = DE_genes,
+    file = paste0(out_path, time_stamp(),"Seurat_DE_Object_",treatment_name,"_Wilcox.rds")
+  )
+  
+  write.csv2(
+    x = DE_genes,
+    row.names = F,
+    file = paste0(out_path, time_stamp(),"Seurat_DE_Table_",treatment_name,"_Wilcox.csv")
+  )
+  
+  
+}
+
+```
+
+### Visualization : MA plots 
+
+```{r Load all files and store in a list}
+
+file_path = get_exp_file_path(
+  organ = "Prostate",
+  project = "Xenograft_Models",
+  samples_ID = "P20-11_21d_ADT_ENZ",
+  prev_exp = "8_Differential_Expression",
+  pattern = "Effect.csv")
+
+Effets_DE_Genes_List = lapply(file_path, function(x){read.csv2(x)})
+
+names(Effets_DE_Genes_List) = c("ADT_Effect", "Enzalutamide_ADT_Effect", "Enzalutamide_Effect")
+
+```
+
+```{r MA plots for each treatment effect}
+
+plot_list <- list()
+plot_id <- 1
+
+for (treatment in names(Effets_DE_Genes_List)) {
+  
+  # Retrieve DE genes table for current treatment
+  genes_FC <- Effets_DE_Genes_List[[treatment]]
+  
+  # Subset SCE object to relevant cells and genes
+  sce_treatment <- sce_obj[, sce_obj$Multiplexing_Condition %in% comparison_list[[treatment]]]
+  sce_treatment <- sce_treatment[rownames(sce_treatment) %in% genes_FC$gene, ]
+  
+  # Compute significance indicators and log10 p-value
+  genes_FC$log10_p_val <- -log10(genes_FC$p_val_adj)
+  genes_FC$significant <- ifelse(genes_FC$p_val_adj < 0.001, "yes", "no")
+  
+  # Annotate fold change categories
+  genes_FC$high_FC <- ifelse(
+    genes_FC$avg_log2FC > 0.5 & genes_FC$significant == "yes", "High_upFC",
+    ifelse(genes_FC$avg_log2FC < -0.5 & genes_FC$significant == "yes", "High_downFC", "Non_Significant")
+  )
+  
+  # Compute average expression from logcounts
+  genes_FC$avg_expression <- rowMeans(as.matrix(logcounts(sce_treatment)[genes_FC$gene,]))
+  
+  # Tag genes to label based on FC threshold
+  genes_FC$label_gene <- ifelse(abs(genes_FC$avg_log2FC) > 0.5, genes_FC$gene, NA)
+  
+  # Identify genes with low fold change for grey background layer
+  genes_FC$low_FC <- ifelse(abs(genes_FC$avg_log2FC) <= 0.5, "yes", "no")
+  
+  # Plot setup
+  plot_list[[plot_id]] <- ggplot(genes_FC, aes(x = avg_expression, y = avg_log2FC)) +
+    
+    # Layer 1: grey background dots for low FC genes
+    geom_point(
+      data = subset(genes_FC, low_FC == "yes"),
+      color = "lightgrey",
+      alpha = 0.6,
+      size = 1
+    ) +
+    
+    # Layer 2: colored dots for significant genes with abs(log2FC) > 0.5
+    geom_point(
+      data = subset(genes_FC, abs(avg_log2FC) > 0.5),
+      aes(fill = high_FC),
+      alpha = 0.8,
+      size = 2,
+      shape = 21
+    ) +
+    
+    # Text labels for strongly changing genes
+    geom_text_repel(
+      data = subset(genes_FC, !is.na(label_gene)),
+      aes(label = label_gene),
+      size = 2.5,
+      max.overlaps = 20,
+      box.padding = 0.3
+    ) +
+    
+    # Color mapping for categories
+    scale_fill_manual(values = c(
+      "High_upFC" = "#FCA08D",
+      "High_downFC" = "#0F6B99FF",
+      "Non_Significant" = "lightgrey"
+    )) +
+    
+    # Plot style and axes
+    theme_classic() +
+    labs(title = treatment) +
+    xlim(0, 8) + ylim(-11, 11) +
+    guides(alpha = "none", size = "none") +
+    
+    # Background annotation rectangles
+    annotate("rect", xmin = -Inf, xmax = Inf, ymin = 0, ymax = 11, fill = "#FFD1DC", alpha = 0.2) +
+    annotate("rect", xmin = -Inf, xmax = Inf, ymin = -11, ymax = 0, fill = "#ADD8E6", alpha = 0.2) +
+    
+    # Top annotation texts
+    annotate("text", x = 6.5, y = 9.5, label = paste0("Up in ", comparison_list[[treatment]][1]),
+             size = 3.5, fontface = "bold", color = "#C2185B") +
+    annotate("text", x = 6.5, y = -9.5, label = paste0("Up in ", comparison_list[[treatment]][2]),
+             size = 3.5, fontface = "bold", color = "#1565C0") +
+    annotate("text", x = 6.5, y = 10.5,
+             label = paste0("(", sum(genes_FC$avg_log2FC > 0.5), " genes with avglog2FC > 0.5)"),
+             size = 2.5) +
+    annotate("text", x = 6.5, y = -10.5,
+             label = paste0("(", sum(genes_FC$avg_log2FC < -0.5), " genes with avglog2FC < -0.5)"),
+             size = 2.5)
+  
+  plot_id <- plot_id + 1
+  
+}
+
+# Create a multi-page layout for the plots
+multiple_page_layout <- gridExtra::marrangeGrob(
+  grobs = plot_list, 
+  nrow = 2, ncol = 1
+)
+
+ggsave(
+  plot = multiple_page_layout,
+  filename = paste0(out_path, time_stamp(),"MA_plot_MAST_DE_genes.pdf"),
+  device = "pdf",
+  width = 6,
+  height = 10
+)
+
+```
+
+
+

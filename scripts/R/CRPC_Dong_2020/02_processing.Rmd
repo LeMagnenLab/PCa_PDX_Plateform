@@ -1,0 +1,780 @@
+---
+title: "Processsing"
+author: "Romuald Parmentier"
+date: "2025-10-28"
+output: html_document
+---
+
+```{r Set up the environment}
+
+#Libraries
+##########
+library(SingleCellExperiment)
+library(scuttle)
+library(dplyr)
+library(scran)
+library(readxl)
+
+### Source Custom Functions
+source("/scicore/home/wykopa75/GROUP/rparmentier/sc_RNAseq/Projects/Prostate/Xenograft_Models/Xenograft_Models_Custom_Functions.R")
+source("/scicore/home/wykopa75/GROUP/rparmentier/sc_RNAseq/Projects/Prostate/Xenograft_Models/Xenograft_Models_Color_Palettes.R")
+
+### Define Output   Path
+out_path <- create_exp_folder(
+  organ = "Prostate",
+  project = "Xenograft_Models",
+  samples_ID = "CRPC_Dong_2020",
+  exp = "2_processing"
+)
+
+
+```
+
+```{r Loading input and creating output path}
+
+file_path = get_exp_file_path(
+  organ = "Prostate",
+  project = "Xenograft_Models",
+  samples_ID = "CRPC_Dong_2020", 
+  prev_exp = "1_quality_controls",
+  pattern = "sce_obj_list_qc_flagged.rds")
+
+list_sce = readRDS(file_path)
+
+```
+
+# Filter and annotate objects
+
+```{r Remove cells: QC flagged}
+
+list_sce <- lapply(list_sce, function(sce){
+  
+  cell_to_keep = which(sce$qc_discarded == F)
+  sce <- sce[, cell_to_keep]
+  
+  sce
+  
+})
+
+```
+
+```{r Remove cells and add metadata (clustering, cell type, NE score): present in metadta table}
+
+cells_metadata_all <- read_excel("/scicore/home/wykopa75/GROUP/rparmentier/sc_RNAseq/Projects/Prostate/Xenograft_Models/bin/CRPC_Dong_2020/42003_2020_1476_MOESM4_ESM.xlsx")
+
+cells_metadata_all = cells_metadata_all %>%
+  dplyr::rename(cell_id = "...1") %>%
+  mutate(
+    sample = case_when(
+      grepl("patient #1", orig.ident) ~ "GSM4089151",
+      grepl("patient #2", orig.ident) ~ "GSM4089152",
+      grepl("patient #3", orig.ident) ~ "GSM4089153",
+      grepl("patient #4", orig.ident) ~ "GSM4089154",
+      grepl("patient #5", orig.ident) ~ "GSM4711414",
+      grepl("patient #6", orig.ident) ~ "GSM4711415",
+      TRUE ~ orig.ident)
+  ) 
+
+cells_metadata_by_sample = cells_metadata_all %>%
+  group_split(sample)
+
+names(cells_metadata_by_sample) = names(list_sce)
+
+### ---- Loop over SCEs ----
+
+for (i in seq_along(list_sce)) {
+  
+  sce <- list_sce[[i]]
+  
+  # Extract sample id like "GSM4089151" from the list name "GSM4089151_P1"
+  sample_id <- names(list_sce)[i]
+  
+  # Get metadata for this sample
+  meta <- cells_metadata_by_sample[[sample_id]]
+  
+  # Cells to keep = intersection between SCE colnames and metadata cell_id
+  cells_keep <- intersect(colnames(sce), meta$cell_id)
+  
+  # Subset SCE to these cells (order will follow 'cells_keep')
+  sce <- sce[, cells_keep, drop = FALSE]
+  
+  # Reorder metadata to match SCE column order
+  row_idx <- match(colnames(sce), meta$cell_id)
+  meta_ord <- meta[row_idx, , drop = FALSE]
+  
+  # Add all metadata columns except 'cell_id' into colData
+  col_to_add <- c( "seurat_clusters", "CellType", "NE_score")
+  
+  # Add the metadata columns you want to include
+  md = as_tibble(colData(sce))
+  md <- bind_cols(md, meta_ord[, col_to_add])
+  
+  colData(sce) = DataFrame(md)
+  
+  # Put back
+  list_sce[[i]] <- sce
+  
+}
+
+```
+
+# All cell types (samples split)
+
+## Normalization (SCT)
+
+```{r SCTranform}
+
+list_seurat = list()
+list_feature_plot = list()
+
+list_seurat <- lapply(seq_along(list_sce), function(i) {
+  
+  sce <- list_sce[[i]]
+  
+  sample_name <- if (!is.null(colData(sce)$sample)) {
+    unique(as.character(colData(sce)$sample))[1]
+  } else if (!is.null(names(list_sce)) && nzchar(names(list_sce)[i])) {
+    names(list_sce)[i]
+  } else {
+    paste0("sample", i)
+  }
+  
+  # Create Seurat object from counts + metadata
+  seu <- CreateSeuratObject(
+    counts   = counts(sce),
+    meta.data = as.data.frame(colData(sce)),
+    project   = sample_name,
+    assay     = "RNA")
+  
+  seu = NormalizeData(object = seu)
+  seu = ScaleData(object = seu)
+  
+  seu <- SCTransform(
+    seu,
+    assay = "RNA", # Raw counts
+    vst.flavor = "v1",
+    verbose = FALSE
+  )
+  
+  # These are now standard steps in the Seurat workflow for visualization and clustering
+  seu <- RunPCA(seu, verbose = FALSE)
+  seu <- RunUMAP(seu, dims = 1:30, verbose = FALSE, n.neighbors = 300) 
+}
+
+)
+
+names(list_seurat) = names(list_sce)
+
+# Save to output path
+saveRDS(list_seurat, file = file.path(out_path, "list_seurat_SCTnormalized.rds"))
+
+```
+
+## Visualization 
+
+```{r Reload list of seurat objects}
+
+file_path = get_exp_file_path(
+  organ = "Prostate",
+  project = "Xenograft_Models",
+  samples_ID = "CRPC_Dong_2020", 
+  prev_exp = "2_processing",
+  pattern = "list_seurat_SCTnormalized.rds")
+
+list_seurat = readRDS(file_path)
+
+```
+
+```{r Cell Types Plot}
+
+plot_list = imap(list_seurat, function(seurat_obj, sample_name){
+  
+  # Exreact metddata
+  md = seurat_obj@meta.data
+  md = as_tibble(md)
+  
+  umap_embeddings = as.data.frame(Embeddings(seurat_obj, "umap"))
+  
+  md$UMAP_1 = umap_embeddings$umap_1
+  md$UMAP_2 = umap_embeddings$umap_2
+  
+  plot <- ggplot(data = md, aes(x = UMAP_1, y = UMAP_2)) +
+    geom_point(
+      data = md,
+      aes(fill = CellType),   # fill controlled by gene expression
+      shape = 21,                    # circle with border
+      colour = "black",              # visible stroke color
+      stroke = 0.2,                  # border thickness
+      size = 1.5,
+      alpha = 0.7) +
+    theme_classic() +
+    # Remove unwanted legends
+    guides(
+      # fill = "none",
+      alpha = "none",
+      size = "none",
+      col = "none"
+    ) +
+    ggtitle(sample_name) +
+    theme(
+      axis.title.x = element_blank(),
+      axis.title.y = element_blank())
+  
+  return(plot)
+  
+})
+
+list_of_grobs = marrangeGrob(
+  grobs = plot_list,
+  ncol = 1,
+  nrow = 1)
+
+ggsave(
+  plot = list_of_grobs,
+  filename = paste0(out_path, time_stamp(), "plots_dotplot_CellType.pdf"),
+  width = 7, height = 5, 
+  device = "pdf"
+)
+
+
+```
+
+# Epithelial cells only (samples split 
+
+```{r Subsetting and re-normalizing the object}
+
+list_seurat_epi <- vector("list", length(list_seurat))
+names(list_seurat_epi) <- names(list_seurat)
+
+for (i in seq_along(list_seurat)) {
+  seu <- list_seurat[[i]]
+  
+  # Subset to epithelial cells
+  cells_epi <-   WhichCells(seu, expression = grepl("epi", CellType, ignore.case = TRUE))
+  seu <- subset(seu, cells = cells_epi)
+  
+  # Re-normalize with SCT (do not also LogNormalize)
+  DefaultAssay(seu) <- "RNA"
+  seu <- SCTransform(seu, vst.flavor = "v1", verbose = FALSE)
+  
+  # Dimensionality reduction + clustering
+  seu <- RunPCA(seu, assay = "SCT", verbose = FALSE)
+  seu <- RunUMAP(seu, dims = 1:30, assay = "SCT", verbose = FALSE)
+  
+  list_seurat_epi[[i]] <- seu
+  
+}
+
+# Save to output path
+saveRDS(list_seurat_epi, file = file.path(out_path, "list_seurat_epi_SCTnormalized.rds"))
+
+```
+
+## Visualization
+
+```{r Reload list of seurat objects}
+
+file_path = get_exp_file_path(
+  organ = "Prostate",
+  project = "Xenograft_Models",
+  samples_ID = "CRPC_Dong_2020", 
+  prev_exp = "2_processing",
+  pattern = "list_seurat_epi_SCTnormalized.rds")
+
+list_seurat_epi = readRDS(file_path)
+
+```
+
+```{r Feature plots canva: colors by log2UMI}
+
+# ---- Parameters ----
+genes_to_plot <- c(
+  "KRT17", "KRT15", "TP63", # Basal markers
+  "AR", "KLK3", "KLK2", 
+  "ASCL1", "CHGA", "SYP",
+  "PROX1", "ALDH1A1", "SOX2")
+
+# one page persample, all genes as feature plots
+list_of_canvas = purrr::imap(list_seurat_epi, function(seurat_obj, sample_name){
+  
+  message("Processing: ", sample_name)
+  
+  DefaultAssay(seurat_obj) <- "RNA"
+  
+  # ---- Extract UMAP and gene expression into a temporary tibble ----
+  umap_df <- as.data.frame(Embeddings(seurat_obj, "umap"))
+  colnames(umap_df) <- c("UMAP_1","UMAP_2")
+  
+  # Fetch expression for requested genes (uses slot = "data" by default)
+  # This returns a data.frame aligned to cells; missing genes are dropped automatically.
+  expr_df <- FetchData(seurat_obj, vars = genes_to_plot, slot = "data", assay = assay_use)
+  
+  # Combine (order is guaranteed to match cells)
+  md <- bind_cols(as_tibble(umap_df), as_tibble(expr_df))
+  
+  
+  # ---- Build one ggplot per present gene ----
+  canva <- map(genes_to_plot, function(gene_name){
+    
+    ggplot(md, aes(UMAP_1, UMAP_2)) +
+      geom_point(aes(fill = .data[[gene_name]]),
+                 shape = 21, colour = "black", stroke = 0.15, size = 1, alpha = 0.9) +
+      scale_fill_gradientn(colors = pal.log2) +
+      coord_equal() +
+      theme_classic() +
+      labs(title = gene_name, fill = "expr") +
+      theme(
+        axis.title = element_blank(),
+        axis.text  = element_blank(),
+        axis.ticks = element_blank(),
+        plot.title = element_text(hjust = 0.5, size = 10)
+      )
+  })
+  
+  return(canva)
+  
+})
+
+# Print them on a pdf file 
+sample_names = names(list_seurat_epi)
+
+{
+  
+  pdf(width = 10, height = 8, file = paste0(out_path, time_stamp(), "plots_dotplot_Epithelial_Expression_Canva.pdf"))
+  
+  for(canva_id in seq_along(list_of_canvas)){
+    
+    canva = list_of_canvas[[canva_id]]
+    sample_name = sample_names[[canva_id]]
+    
+    canva_print = marrangeGrob(
+      grobs = canva,
+      top = sample_name,
+      ncol = 4,
+      nrow = 3)
+    
+    print(canva_print)
+    
+  }
+  
+  dev.off()
+  
+}
+
+```
+
+```{r Feature plots canva: colors by NE.scores}
+
+# one page persample, all genes as feature plots
+list_of_NEscores = purrr::imap(list_seurat_epi, function(seurat_obj, sample_name){
+  
+  message("Processing: ", sample_name)
+  
+  DefaultAssay(seurat_obj) <- "RNA"
+  
+  # ---- Extract UMAP and gene expression into a temporary tibble ----
+  umap_df <- as.data.frame(Embeddings(seurat_obj, "umap"))
+  colnames(umap_df) <- c("UMAP_1","UMAP_2")
+  
+  # Fetch expression for requested genes (uses slot = "data" by default)
+  # This returns a data.frame aligned to cells; missing genes are dropped automatically.
+  NE_df <- seurat_obj@meta.data$NE_score
+  
+  # Combine (order is guaranteed to match cells)
+  md <- bind_cols(as_tibble(umap_df), as_tibble(NE_df))
+  md = md %>% rename(NE_Score = "value")
+  # ---- Build one ggplot per present gene ----
+  
+  plot <- ggplot(data = md, aes(x = UMAP_1, y = UMAP_2)) +
+    # First layer of cells with expression z-score arround 0
+    ggrastr::rasterise(
+      geom_point(
+        data = md %>% dplyr::filter(.data[["NE_Score"]] > - 0.5 & .data[["NE_Score"]] < 0.5),
+        aes(fill = .data[["NE_Score"]]),   # fill controlled by gene expression
+        shape = 21,                    # circle with border
+        colour = "black",              # visible stroke color
+        stroke = 0.2,                  # border thickness
+        size = 1,
+        alpha = 0.4),
+      dpi = 300,
+      scale = 0.7) +
+    # Second layer of cells with expression z-score above/below 0.5/-0.5
+    geom_point(
+      data = md %>% dplyr::filter(.data[["NE_Score"]] < -0.5 | .data[["NE_Score"]] > 0.5),
+      aes(fill = .data[["NE_Score"]]),   # fill controlled by gene expression
+      shape = 21,                    # circle with border
+      colour = "black",              # visible stroke color
+      stroke = 0.2,                  # border thickness
+      size = 0.9,
+      alpha = 1) +
+    scale_fill_gradientn(colors = pal.log2) +
+    theme_classic() +
+    # Remove unwanted legends
+    guides(
+      # fill = "none",
+      alpha = "none",
+      size = "none",
+      col = "none"
+    ) +
+    ggtitle(sample_name) +
+    theme(
+      axis.title.x = element_blank(),
+      axis.title.y = element_blank())
+  
+  return(plot)
+  
+})
+
+# Print them on a pdf file 
+
+{
+  
+  pdf(width = 10, height = 8, file = paste0(out_path, time_stamp(), "plots_dotplot_Epithelial_Expression_NEscores.pdf"))
+  
+  canva_print = marrangeGrob(
+    grobs = list_of_NEscores,
+    ncol = 3,
+    nrow = 2)
+  
+  print(canva_print)
+  
+  dev.off()
+  
+}
+
+
+```
+
+```{r Feature plots canva: colors by scaled.data (zscores)}
+
+# ---- Parameters ----
+
+genes_to_plot <- c(
+  "KRT17", "KRT15", "TP63", # Basal markers
+  "AR", "KLK3", "KLK2", 
+  "ASCL1", "CHGA", "SYP",
+  "PROX1", "ALDH1A1", "SOX2")
+
+# one page persample, all genes as feature plots
+list_of_canvas = purrr::imap(list_seurat_epi, function(seurat_obj, sample_name){
+  
+  message("Processing: ", sample_name)
+  
+  DefaultAssay(seurat_obj) <- "RNA"
+  
+  # ---- Extract UMAP and gene expression into a temporary tibble ----
+  umap_df <- as.data.frame(Embeddings(seurat_obj, "umap"))
+  colnames(umap_df) <- c("UMAP_1","UMAP_2")
+  
+  # Fetch expression for requested genes (uses slot = "data" by default)
+  # This returns a data.frame aligned to cells; missing genes are dropped automatically.
+  expr_df <- FetchData(seurat_obj, vars = genes_to_plot, slot = "scale.data", assay = assay_use)
+  
+  # Combine (order is guaranteed to match cells)
+  md <- bind_cols(as_tibble(umap_df), as_tibble(expr_df))
+  
+  # ---- Build one ggplot per present gene ----
+  canva <- map(genes_to_plot, function(gene_name){
+    
+    plot <- ggplot(data = md, aes(x = UMAP_1, y = UMAP_2)) +
+      # First layer of cells with expression z-score arround 0
+      ggrastr::rasterise(
+        geom_point(
+          data = md %>% dplyr::filter(.data[[gene_name]] > - 0.5 & .data[[gene_name]] < 0.5),
+          aes(fill = .data[[gene_name]]),   # fill controlled by gene expression
+          shape = 21,                    # circle with border
+          colour = "black",              # visible stroke color
+          stroke = 0.2,                  # border thickness
+          size = 1,
+          alpha = 0.4),
+        dpi = 300,
+        scale = 0.7) +
+      # Second layer of cells with expression z-score above/below 0.5/-0.5
+      geom_point(
+        data = md %>% dplyr::filter(.data[[gene_name]] < -0.5 | .data[[gene_name]] > 0.5),
+        aes(fill = .data[[gene_name]]),   # fill controlled by gene expression
+        shape = 21,                    # circle with border
+        colour = "black",              # visible stroke color
+        stroke = 0.2,                  # border thickness
+        size = 0.9,
+        alpha = 1) +
+      # Apply a custom continuous color scale
+      scale_fill_gradientn(
+        colours = c("blue", "white", "red"),
+        limits = c(-3, 3),  # symmetric range
+        name = "Z-score"
+      ) +
+      theme_classic() +
+      # Remove unwanted legends
+      guides(
+        # fill = "none",
+        alpha = "none",
+        size = "none",
+        col = "none"
+      ) +
+      ggtitle(gene_name) +
+      theme(
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank())
+    
+    
+    
+  })
+  
+  return(canva)
+  
+})
+
+# Print them on a pdf file 
+
+{
+  
+  pdf(width = 10, height = 8, file = paste0(out_path, time_stamp(), "plots_dotplot_Epithelial_Expression_Canva_Scaled.pdf"))
+  
+  for(canva in list_of_canvas){
+    
+    canva_print = marrangeGrob(
+      grobs = canva,
+      ncol = 4,
+      nrow = 3)
+    
+    print(canva_print)
+    
+  }
+  
+  dev.off()
+  
+}
+
+
+```
+
+# Epithelial cells only (integrated samples)
+
+## Batch correction
+
+```{r}
+
+nepc.anchors <- FindIntegrationAnchors(
+  object.list = list(
+    list_seurat_epi$GSM4089153_P3,
+    list_seurat_epi$GSM4711414_P5
+  ), 
+  dims = 1:20)
+
+nepc.combined <- IntegrateData(anchorset = nepc.anchors, dims = 1:20)
+
+
+DefaultAssay(nepc.combined) <- "integrated"
+
+# Run the standard workflow for visualization and clustering
+nepc.combined <- ScaleData(nepc.combined, verbose = FALSE)
+nepc.combined <- RunPCA(nepc.combined, npcs = 30, verbose = FALSE)
+
+# t-SNE and Clustering
+nepc.combined <- RunUMAP(nepc.combined, reduction = "pca", dims = 1:20)
+nepc.combined <- FindNeighbors(nepc.combined, reduction = "pca", dims = 1:20)
+nepc.combined <- FindClusters(nepc.combined, resolution = 0.5)
+
+
+```
+
+## Visualization
+
+```{r Feature plots canva: colors by log2UMI}
+
+genes_to_plot <- c("AR","PROX1","ALDH1A1")
+
+DefaultAssay(nepc.combined) <- "RNA"
+
+# ---- Extract UMAP and gene expression into a temporary tibble ----
+umap_df <- as.data.frame(Embeddings(nepc.combined, "umap"))
+colnames(umap_df) <- c("UMAP_1","UMAP_2")
+
+# Fetch expression for requested genes (uses slot = "data" by default)
+# This returns a data.frame aligned to cells; missing genes are dropped automatically.
+expr_df <- FetchData(nepc.combined, vars = genes_to_plot, slot = "data", assay = assay_use)
+
+# Combine (order is guaranteed to match cells)
+md <- bind_cols(as_tibble(umap_df), as_tibble(expr_df))
+
+# ---- Build one ggplot per present gene ----
+canva <- map(genes_to_plot, function(gene_name){
+  
+  plot = ggplot(md, aes(UMAP_1, UMAP_2)) +
+    geom_point(aes(fill = .data[[gene_name]]),
+               shape = 21, colour = "black", stroke = 0.15, size = 1, alpha = 0.9) +
+    scale_fill_gradientn(colors = pal.log2) +
+    coord_equal() +
+    theme_classic2() +
+    labs(title = gene_name, fill = "expr") +
+    theme(
+      plot.title = element_text(hjust = 0.5, size = 10)
+    )
+  
+  return(plot)
+}
+)
+
+plot_list = marrangeGrob(
+  grobs = canva,
+  ncol = 1,
+  nrow = 3)
+
+ggsave(plot_list, 
+       width = 210, height = 210, units = "mm", 
+       file = paste0(out_path, time_stamp(), "plots_dotplot_DNPC_AR_PROX1_ALDH1A1.pdf"))
+
+
+```
+
+# Epithelial cells only (integrated samples)
+
+```{r Reload list of seurat objects}
+
+file_path = get_exp_file_path(
+  organ = "Prostate",
+  project = "Xenograft_Models",
+  samples_ID = "CRPC_Dong_2020", 
+  prev_exp = "2_processing",
+  pattern = "list_seurat_epi_SCTnormalized.rds")
+
+list_seurat_epi = readRDS(file_path)
+
+
+# Subset NEPC and DNPC samples (AR low)
+list_seurat_epi_nepc_dnpc = list_seurat_epi[c("GSM4089152_P2","GSM4089153_P3","GSM4711414_P5")]
+
+merged_nepc_dnpc = merge(
+  list_seurat_epi_nepc_dnpc$GSM4089152_P2, 
+  y = c(list_seurat_epi_nepc_dnpc$GSM4089153_P3, list_seurat_epi_nepc_dnpc$GSM4711414_P5), 
+  add.cell.ids = c("P2", "P3", "P5"))
+
+DefaultAssay(merged_nepc_dnpc) <- "RNA"
+
+merged_nepc_dnpc <- SCTransform(
+  merged_nepc_dnpc,
+  assay = "RNA",
+  vst.flavor = "v2",               # or "v1" if you prefer
+  conserve.memory = TRUE,
+  verbose = TRUE
+)   
+
+# These are now standard steps in the Seurat workflow for visualization and clustering
+merged_nepc_dnpc <- RunPCA(merged_nepc_dnpc, verbose = FALSE)
+merged_nepc_dnpc <- RunUMAP(merged_nepc_dnpc, dims = 1:30, verbose = FALSE, n.neighbors = 300) 
+
+```
+
+```{r Export non batch corrected merged object}
+
+saveRDS(
+  object = merged_nepc_dnpc,
+  file = paste0(out_path, time_stamp(), "seurat_merged_NEPC-DNPC_patients_Non_Batch_Corrected.rds"))
+
+```
+
+## Merging and normalization
+
+```{r UMAP plot: colored by patient ID}
+
+# ---- Extract UMAP and gene expression into a temporary tibble ----
+umap_df <- as.data.frame(Embeddings(merged_nepc_dnpc, "umap"))
+colnames(umap_df) <- c("UMAP_1","UMAP_2")
+
+# Combine (order is guaranteed to match cells)
+md <- bind_cols(as_tibble(umap_df), as_tibble(merged_nepc_dnpc@meta.data))
+
+# ---- Build one ggplot per present gene ----
+
+plot = ggplot(md, aes(UMAP_1, UMAP_2)) +
+  ggrastr::rasterise(
+    geom_point(
+      data = md,
+      aes(fill = sample),   # fill controlled by gene expression
+      shape = 21,                    # circle with border
+      colour = "gray10",              # visible stroke color
+      stroke = 0.2,                  # border thickness
+      size = 1,
+      alpha = 0.7), dpi = 300, scale = 1) +
+  theme_classic() +
+  guides(fill = guide_legend(override.aes=list(size = 3, alpha = 0.9), title = "Patient ID")) + coord_equal()
+
+
+ggsave(plot, 
+       width = 210, height = 105, units = "mm", 
+       file = paste0(out_path, time_stamp(), "plots_DNPC_NEPC_PAtient_ID_Non_Corrected.pdf"))
+
+```
+
+```{r Feature plots canva: colors by log2UMI - mixed}
+
+genes_to_plot <- c("KLK3", "CHGA", "PROX1","ALDH1A1")
+
+DefaultAssay(merged_nepc_dnpc) <- "RNA"
+
+# ---- Extract UMAP and gene expression into a temporary tibble ----
+umap_df <- as.data.frame(Embeddings(merged_nepc_dnpc, "umap"))
+colnames(umap_df) <- c("UMAP_1","UMAP_2")
+
+# Fetch expression for requested genes (uses slot = "data" by default)
+# This returns a data.frame aligned to cells; missing genes are dropped automatically.
+expr_df <- FetchData(merged_nepc_dnpc, vars = genes_to_plot, slot = "data", assay = assay_use)
+
+# Combine (order is guaranteed to match cells)
+md <- bind_cols(as_tibble(umap_df), as_tibble(expr_df))
+
+# ---- Build one ggplot per present gene ----
+canva <- map(genes_to_plot, function(gene_name){
+  
+  ggplot(md, aes(UMAP_1, UMAP_2)) +
+    ggrastr::rasterise(
+      geom_point(
+        aes(
+          fill = .data[[gene_name]],
+          alpha = .data[[gene_name]] > 0   # control alpha based on expression
+        ),
+        shape = 21,
+        colour = "black",
+        stroke = 0.2,
+        size = 1
+      ), scale = 1, dpi = 300) +
+    scale_fill_gradientn(colors = pal.log2) +
+    scale_alpha_manual(
+      values = c("FALSE" = 0.15, "TRUE" = 1),   # zeros faint, positives solid
+      guide = "none"                            # hide alpha legend
+    ) +
+    coord_equal() +
+    theme_classic2() +
+    labs(
+      title = gene_name,
+      fill = "Log2(UMI)"
+    ) +
+    theme(
+      plot.title = element_text(hjust = 0.5, size = 10)
+    )
+})
+
+plot_list = marrangeGrob(
+  grobs = canva,
+  ncol = 1,
+  nrow = 1)
+
+ggsave(plot_list, 
+       width = 4, height = 4,
+       file = paste0(out_path, time_stamp(), "plots_DNPC_NEPC_KLK3_CHGA_PROX1_ALDH1A1_Mixed_Non_Corrected.pdf"))
+
+```
+
+```{r Feature plots: coexpression ALDH1A1-PROX1}
+
+DefaultAssay(merged_nepc_dnpc) = "RNA"
+
+plot = Plot_Density_Joint_Only(seurat_object = merged_nepc_dnpc, features = c("PROX1", "ALDH1A1"), custom_palette = pal.log2) +
+  coord_equal()
+
+ggsave(plot, 
+       width = 210, height = 105, units = "mm", 
+       file = paste0(out_path, time_stamp(), "plots_DNPC_NEPC_Coedpression_ALDH1A1_PROX1_Non_Corrected.pdf"))
+
+```

@@ -1,0 +1,556 @@
+---
+title: "Comon step 3 : Compute QC"
+author: "Romuald Parmentier"
+date: "2025-03-18"
+output: html_document
+---
+
+```{r}
+
+### Load Required Libraries
+library(SingleCellExperiment)
+library(scater)
+library(scran)
+library(scuttle)
+library(scDblFinder)
+library(AnnotationHub)
+library(dplyr)
+library(ComplexHeatmap) # Needed for UpsetPlot
+
+### Source Custom Functions
+source("/scicore/home/wykopa75/GROUP/rparmentier/sc_RNAseq/Projects/Prostate/Xenograft_Models/Xenograft_Models_Custom_Functions.R")
+source("/scicore/home/wykopa75/GROUP/rparmentier/sc_RNAseq/Projects/Prostate/Xenograft_Models/Xenograft_Models_Color_Palettes.R")
+
+### Define Output Path
+out_path <- create_exp_folder(
+  organ = "Prostate",
+  project = "Xenograft_Models",
+  samples_ID = "Comon_Steps",
+  exp = "3_QC_HTO_and_Non_HTO_Samples"
+)
+
+```
+
+# Prepare the data
+
+```{r Load the files}
+
+# Load sce object after HTO Demux
+#################################
+
+file_path = get_exp_file_path(
+  organ = "Prostate",
+  project = "Xenograft_Models",
+  samples_ID = "Comon_Steps",
+  prev_exp = "2_Demux_All_HTO_samples", 
+  pattern = "list_sce_demux.rds")
+
+list_sce = readRDS(file = file_path) 
+
+# Load sce objects without HTO Demux
+####################################
+
+non_hto_samples = c("rm01", "rp01", "rp12", "rp13")
+
+for (sample_id in non_hto_samples) {
+  
+  sce_path <- paste0(
+    "/scicore/home/wykopa75/GROUP/rparmentier/sc_RNAseq/Projects/Prostate/Xenograft_Models/bin/Comon_Steps/0_Comon_STARSolo_Preprocessing/results/empty_drops/",
+    sample_id, 
+    "/hg38_ensdb_110_sce.rds")
+  
+  sce_obj <- readRDS(sce_path)
+  
+  # Addd colomuns to metadata to mazch columns of HTO Demux samples
+  sce_obj$ident.demultiplex2 = "Non_Applicable"
+  sce_obj$Multiplexing_Condition = "Non_Applicable"
+  sce_obj$Multiplet_Class = "Singlet"
+  
+  list_sce[[sample_id]] = sce_obj
+  
+}
+
+names = names(list_sce)
+```
+
+```{r Annotate sce with metadata}
+
+for(sce_id in names(list_sce)){
+  
+  sce_obj = list_sce[[sce_id]]
+  
+  # Type of system
+  sce_obj$Model_System = ifelse(
+    test = grepl(x = sce_obj$SampleGroup, pattern = "Org"),
+    yes =  "Xenograft_Organoids",
+    no = ifelse(
+      test = grepl(x = sce_obj$SampleGroup, pattern = "_PDO_"),
+      yes =  "Patient_Organoids",
+      no = "Xenograft")
+  )
+  
+  # Patient ID
+  sce_obj$Model_ID = ifelse(
+    test = grepl(x = sce_obj$SampleGroup, pattern = "P20-11"),
+    yes =  "P20-11",
+    no = "P20-23"
+  )
+  
+  # Add the model passage (Xenograft) 
+  sce_obj$Model_Passage = str_extract(string = sce_obj$SampleGroup, pattern = "(?<=_)P[0-9]")
+  
+  # Add the Mouse ID (first passage)
+  sce_obj$Model_Mouse <- ifelse(
+    test = grepl(x = sce_obj$SampleGroup, pattern = "_PDOXA_|_PDOXB_"),
+    yes = paste0("Mouse_", str_extract(sce_obj$SampleGroup, "(?<=PDOX)[A-Z]")),
+    no = ifelse(
+      test = grepl(x = sce_obj$SampleGroup, pattern = "PDOXA&B") & grepl(x = sce_obj$Multiplexing_Condition, pattern = "PDOX"),
+      yes = paste0("Mouse_", str_extract(sce_obj$Multiplexing_Condition, "(?<=PDOX)[A-Z]")),
+      no = "Not_Applicable"
+    )
+  )
+  
+  list_sce[[sce_id]] = sce_obj
+  
+}
+
+
+```
+
+
+```{r}
+
+# --- Standardize colData columns across SCEs ---
+common_colnames <- Reduce(intersect, lapply(list_sce, function(sce) colnames(colData(sce))))
+
+list_sce <- lapply(list_sce, function(sce) {
+  colData(sce) <- colData(sce)[, common_colnames, drop = FALSE]
+  return(sce)
+})
+
+# --- Rename cells by appending sample name ---
+
+SampleNames = names(list_sce) 
+
+list_sce <- lapply(names(list_sce), function(sample_name) {
+  
+  sce <- list_sce[[sample_name]]
+  colnames(sce) <- paste0(colnames(sce), "-1_", sample_name)
+  return(sce)
+  
+})
+
+names(list_sce) <- SampleNames  # restore names
+
+```
+
+
+# Perform QC analysis (only flag cells, don't discard them)
+
+```{r}
+
+# Load annotation
+EnsDb.Hsapiens.v104 <- AnnotationHub(localHub = TRUE)[["AH95744"]]
+
+# Summary tables
+qc_metrics_all_samples <- data.frame()
+qc_metrics_hto_samples <- data.frame()
+
+# Iterate over samples
+for (sce_id in seq_along(list_sce)) {
+  
+  sample_name <- names(list_sce)[[sce_id]]
+  print(paste0("Computing QC for sample ", sample_name))
+  
+  sce_obj <- list_sce[[sce_id]]
+  
+  # ---------- Gene Annotation ----------
+  rowData(sce_obj) <- DataFrame(ENSEMBL = rownames(sce_obj))
+  
+  gene_info <- as_tibble(rowData(sce_obj)) %>%
+    dplyr::select(ENSEMBL) %>%
+    mutate(
+      SYMBOL = mapIds(EnsDb.Hsapiens.v104, keys = ENSEMBL, keytype = "GENEID", column = "SYMBOL", multiVals = "first"),
+      GENEBIOTYPE = mapIds(EnsDb.Hsapiens.v104, keys = ENSEMBL, keytype = "GENEID", column = "GENEBIOTYPE", multiVals = "first"),
+      SEQNAME = mapIds(EnsDb.Hsapiens.v104, keys = ENSEMBL, keytype = "GENEID", column = "SEQNAME", multiVals = "first")
+    )
+  
+  gene_info_filtered <- gene_info %>%
+    dplyr::filter(
+      SEQNAME %in% c(as.character(1:22), "MT", "X", "Y"),
+      GENEBIOTYPE %in% c("protein_coding", "lncRNA"),
+      !is.na(SYMBOL) & SYMBOL != ""
+    ) %>%
+    distinct(SYMBOL, .keep_all = TRUE)
+  
+  common_genes <- intersect(rownames(sce_obj), gene_info_filtered$ENSEMBL)
+  subset_counts <- counts(sce_obj)[common_genes, , drop = FALSE]
+  rownames(gene_info_filtered) <- gene_info_filtered$ENSEMBL
+  
+  sce_obj <- SingleCellExperiment(
+    assays = list(counts = subset_counts),
+    rowData = DataFrame(gene_info_filtered),
+    colData = colData(sce_obj)
+  )
+  
+  # Set Symbols as rownames
+  rownames(sce_obj) = rowData(sce_obj)$"SYMBOL"
+  
+  # ---------- QC Metrics ----------
+  n_cells_original <- ncol(sce_obj)
+  print("QC metrics: UMI, gene, mito")
+  
+  sce_obj <- addPerCellQCMetrics(
+    x = sce_obj,
+    subsets = list(mitochondrial_reads = grep("MT", rowData(sce_obj)$SEQNAME))
+  )
+  
+  # ---------- Pre-flag low UMI/gene cells ----------
+  print("Flag low UMI / gene cells before scDblFinder")
+  
+  min_UMI <- 10000
+  min_genes <- 1000
+  mito_thresh <- 25
+  
+  sce_obj$UMI_discarded <- sce_obj$sum < min_UMI
+  sce_obj$gene_discarded <- sce_obj$detected < min_genes
+  sce_obj$Excluded_LowCounts <- sce_obj$UMI_discarded | sce_obj$gene_discarded
+  
+  # ---------- Run scDblFinder on high-quality cells only ----------
+  print("Running scDblFinder on filtered cells")
+  
+  sce_high_qc <- sce_obj[, !sce_obj$Excluded_LowCounts]
+  
+  sce_high_qc <- logNormCounts(sce_high_qc)
+  top_genes <- getTopHVGs(modelGeneVar(sce_high_qc), n = 1000)
+  sce_high_qc <- runPCA(sce_high_qc, subset_row = top_genes)
+  sce_high_qc <- scDblFinder(sce_high_qc, dbr = 0.076)
+  
+  # ---------- Map back scDblFinder results ----------
+  sce_obj$scDblFinder.class <- "Excluded_LowCounts"
+  sce_obj$scDblFinder_discarded <- FALSE
+  
+  # Match cell names between filtered and original SCE (idx of sce_high_qc)
+  cell_match_idx <- match(colnames(sce_high_qc), colnames(sce_obj))
+  sce_obj$scDblFinder.class[cell_match_idx] <- as.character(sce_high_qc$scDblFinder.class)
+  sce_obj$scDblFinder_discarded[cell_match_idx] <- sce_high_qc$scDblFinder.class == "doublet"
+  
+  # ---------- HTO discard flags ----------
+  sce_obj$hto_negative_discarded <- ifelse(
+    test = sce_obj$Multiplet_Class == "Negative",
+    yes = TRUE,
+    no = FALSE
+  )
+  
+  sce_obj$hto_multiplet_discarded <- ifelse(
+    test = sce_obj$Multiplet_Class == "Multiplet",
+    yes = TRUE,
+    no = FALSE
+  )
+  
+  # ---------- Mito discard ----------
+  sce_obj$mito_discarded <- sce_obj$subsets_mitochondrial_reads_percent > mito_thresh
+  
+  # ---------- Global discard flag ----------
+  sce_obj$qc_discarded <- with(colData(sce_obj),
+                               scDblFinder_discarded | UMI_discarded | gene_discarded |
+                                 mito_discarded | hto_negative_discarded | hto_multiplet_discarded
+  )
+  
+  # ---------- All-sample summary ----------
+  df_row <- data.frame(
+    Library_ID = sample_name,
+    Sample_Name = unique(sce_obj$SampleName),
+    Cells_Original = ncol(sce_obj),
+    Cells_Doublets = sum(sce_obj$scDblFinder_discarded),
+    Cells_LowUMI = sum(sce_obj$UMI_discarded),
+    Cells_LowGenes = sum(sce_obj$gene_discarded),
+    Cells_HighMito = sum(sce_obj$mito_discarded),
+    HTO_Negatives = sum(sce_obj$hto_negative_discarded),
+    HTO_Multiplets = sum(sce_obj$hto_multiplet_discarded),
+    Cells_Retained = sum(!sce_obj$qc_discarded)
+  )
+  
+  qc_metrics_all_samples <- bind_rows(qc_metrics_all_samples, df_row)
+  
+  # ---------- HTO-based per-condition summary ----------
+  if (any(sce_obj$ident.demultiplex2 != "Non_Applicable")) {
+    sce_meta <- as.data.frame(colData(sce_obj)) %>%
+      dplyr::filter(Multiplexing_Condition != "Undefined")
+    
+    condition_summary <- sce_meta %>%
+      group_by(Multiplexing_Condition) %>%
+      summarise(
+        Library_ID = sample_name,
+        Sample_Name = unique(SampleName),
+        Cells_Total = n(),
+        Cells_Doublets = sum(scDblFinder_discarded),
+        Cells_LowUMI = sum(UMI_discarded),
+        Cells_LowGenes = sum(gene_discarded),
+        Cells_HighMito = sum(mito_discarded),
+        HTO_Negatives = sum(hto_negative_discarded),
+        HTO_Multiplets = sum(hto_multiplet_discarded),
+        Cells_Retained = sum(!qc_discarded),
+        .groups = "drop"
+      )
+  
+    
+    qc_metrics_hto_samples <- bind_rows(qc_metrics_hto_samples, condition_summary)
+  }
+  
+  
+
+  # ---------- Save updated object ----------
+  list_sce[[sample_name]] <- sce_obj
+}
+
+# ---------- Export summaries ----------
+write.csv(qc_metrics_all_samples, file = paste0(out_path, "qc_metrics_all_samples.csv"), row.names = FALSE)
+write.csv(qc_metrics_hto_samples, file = paste0(out_path, "qc_metrics_hto_samples.csv"), row.names = FALSE)
+
+# ---------- Export flagged list of sce ----------
+saveRDS(object = list_sce, file = paste0(out_path, "list_sce_flag_qc.rds"))
+
+```
+
+
+# Visualization 
+
+```{r Extract metadata per sample}
+
+list_md_df <- lapply(list_sce, function(x){
+  md_df = as_tibble(colData(x))
+  return(md_df)
+})
+names(list_md_df) = names(list_sce)
+
+```
+
+```{r Plot histogram: helper function definition}
+
+plot_qc_histogram <- function(
+    df,
+    metric_col,
+    threshold,
+    discard_flag,
+    log_x = FALSE,
+    log_y = FALSE,
+    binwidth = NULL,
+    title_label = NULL,
+    sample_name = NULL
+) {
+  # Clean label for axis
+  label_clean <- gsub("_", " ", metric_col)
+  
+  # Generate clean, biologically meaningful x-axis labels
+  x_label <- case_when(
+    metric_col == "sum" ~ "Total UMI count per cell ",
+    metric_col == "detected" ~ "Number of detected genes per cell + 1",
+    metric_col == "subsets_mitochondrial_reads_percent" ~ "% Mitochondrial reads per cell",
+    TRUE ~ gsub("_", " ", metric_col)  # fallback
+  )
+  # Classify cells
+  df$QC.treshold <- ifelse(df[[discard_flag]], "Discarded", "Kept")
+  
+  # Manual log-transform for x-axis if requested
+  if (log_x) {
+    df$log_value <- log10(df[[metric_col]] + 1)
+    x_col <- "log_value"
+    threshold <- log10(threshold + 1)
+  } else {
+    x_col <- metric_col
+  }
+  
+  # Set binwidth
+  values <- df[[x_col]]
+  if (is.null(binwidth)) {
+    binwidth <- (max(values, na.rm = TRUE) - min(values, na.rm = TRUE)) / 100
+  }
+  
+  # Build plot
+  p <- ggplot(df, aes_string(x = x_col, fill = "QC.treshold")) +
+    geom_histogram(
+      binwidth = binwidth,
+      alpha = 0.6,
+      position = "stack",
+      color = "black"
+    ) +
+    geom_vline(xintercept = threshold, linetype = "dashed", color = "black") +
+    scale_fill_manual(values = c("Discarded" = "red", "Kept" = "green")) +
+    xlab(x_label) +
+    ylab(if (log_y) "Cell count (log10)" else "Cell count") +
+    ggtitle(
+      paste0("Sample: ", sample_name, " | ", title_label),
+      subtitle = paste0(
+        "Threshold = ", round(10^threshold - 1), "\n",
+        "Discarded: ", sum(df[[discard_flag]], na.rm = TRUE),
+        " | Kept: ", sum(!df[[discard_flag]], na.rm = TRUE),
+        " | Total: ", nrow(df))
+    ) +
+    theme_minimal()
+  
+  # Custom x-axis tick labels (for log_x)
+  if (log_x) {
+    # Get the minimum and maximum of the transformed log10 values
+    # Floor and ceiling are used to cover the full range neatly
+    log_min <- floor(min(values, na.rm = TRUE))
+    log_max <- ceiling(max(values, na.rm = TRUE))
+    
+    # Create evenly spaced breaks in log space (e.g. 3, 4, 5)
+    # These correspond to powers of 10 (10^3 = 1000, etc.)
+    breaks <- seq(log_min, log_max, by = 1)
+    
+    # Convert log10-scale breaks back to raw values for axis labels
+    # Use format() to clean up large numbers (e.g. 10000 → "10,000")
+    labels <- format(10^breaks, scientific = FALSE, big.mark = ",")
+    
+    # Apply custom breaks and labels to x-axis
+    # This avoids weird midpoints like 3162 and uses nice round values instead
+    p <- p + scale_x_continuous(breaks = breaks, labels = labels)
+  }
+  
+  if (log_y) {
+    p <- p + scale_y_continuous(trans = "log10")
+  }
+  
+  return(p)
+}
+
+```
+
+```{r Plot histogram: ploting UmiCount, GeneCount and mitoRead distribution}
+
+plot_list = list()
+sce_id = 1
+
+for (md_df in list_md_df) {
+  
+  sample_name <- unique(md_df$SampleName)
+  sample_group <- unique(md_df$SampleGroup)
+  
+  p_umi <- plot_qc_histogram(
+    df = md_df,
+    metric_col = "sum",
+    threshold = 10000,
+    discard_flag = "UMI_discarded",
+    log_x = T,
+    log_y = FALSE,
+    title_label = "UMI (Read) counts",
+    sample_name = paste0(sample_group, " (", sample_name, ")")
+  )
+  
+  p_genes <- plot_qc_histogram(
+    df = md_df,
+    metric_col = "detected",
+    threshold = 1000,
+    discard_flag = "gene_discarded",
+    log_x = TRUE,
+    log_y = FALSE,
+    title_label = "Gene counts per cell",
+    sample_name = paste0(sample_group, " (", sample_name, ")")
+  )
+  
+  # Mito plot: only for cells passing UMI + gene thresholds
+  md_df_mito <- md_df[!md_df$UMI_discarded & !md_df$gene_discarded, ]
+  
+  p_mito <- plot_qc_histogram(
+    df = md_df_mito,
+    metric_col = "subsets_mitochondrial_reads_percent",
+    threshold = 25,
+    discard_flag = "mito_discarded",
+    log_x = FALSE,
+    binwidth = 1,
+    title_label = "% Mitochondrial reads (low counts/genes cells filtered)",
+    sample_name = paste0(sample_group, " (", sample_name, ")")
+  )
+  
+  plot_list[[sce_id]] <- gridExtra::arrangeGrob(p_umi, p_genes,p_mito, ncol = 1)
+  sce_id <- sce_id + 1
+}
+
+ggsave(
+  plot = gridExtra::marrangeGrob(plot_list, nrow = 1, ncol = 1),
+  filename = paste0(out_path, time_stamp(), "qc_bars_mito_reads_genes.pdf"),
+  device = "pdf", width = 210, height = 297, units = "mm"
+)
+
+```
+
+```{r Gene vs Mitocohdrial reads }
+
+plot_list = list()
+sce_id = 1
+
+for (md_df in list_md_df) {
+  
+  sample_name <- unique(md_df$SampleName)
+  sample_group <- unique(md_df$SampleGroup)
+  sample_label <- paste0(sample_group, " (", sample_name, ")")
+  
+  # Prepare log-scale tick formatting
+  log_min <- floor(log10(min(md_df$sum + 1, na.rm = TRUE)))
+  log_max <- ceiling(log10(max(md_df$sum + 1, na.rm = TRUE)))
+  breaks <- seq(log_min, log_max, by = 1)
+  labels <- format(10^breaks, big.mark = ",", scientific = FALSE)
+  
+  plot <- ggplot(md_df, aes(x = sum, y = detected)) +
+    geom_point(aes(color = subsets_mitochondrial_reads_percent), size = 0.5) +
+    scale_x_log10(breaks = 10^breaks, labels = labels) +
+    scale_color_gradient2(low = "darkblue", mid = "yellow", high = "darkred", midpoint = 50) +
+    xlab("Total UMI count per cell") +
+    ylab("Number of detected genes per cell") +
+    labs(color = "% Mitochondrial reads") +
+    ggtitle(
+      paste0("Sample: ", sample_label),
+      subtitle = paste0("Retained: ", sum(!md_df$qc_discarded), " / Total: ", nrow(md_df))
+    )
+  
+  plot_list[[sce_id]] <- plot
+  sce_id <- sce_id + 1
+}
+
+ggsave(
+  plot = gridExtra::marrangeGrob(plot_list, nrow = 2, ncol = 1),
+  filename = paste0(out_path, time_stamp(), "plot_mito_reads_genes.pdf"),
+  device = "pdf", width = 210, height = 297, units = "mm"
+)
+
+```
+
+```{r Upset plot}
+
+plot_list = list()
+sce_id = 1
+
+for (md_df in list_md_df) {
+  
+  name = names(list_md_df)[sce_id]
+  sample_name = unique(md_df$SampleName)
+  
+  comb_mat <- md_df %>%
+    dplyr::select(scDblFinder_discarded, UMI_discarded, gene_discarded, mito_discarded, 
+                  hto_negative_discarded, hto_multiplet_discarded) %>%
+    mutate(across(.cols = everything(), as.integer)) %>%
+    ComplexHeatmap::make_comb_mat()
+  
+  plot <- ComplexHeatmap::UpSet(
+    comb_mat,
+    column_title = paste0("Sample: ", sample_name, " | QC discard combinations"),
+    comb_order = order(-comb_size(comb_mat)),
+    top_annotation = upset_top_annotation(comb_mat, add_numbers = TRUE),
+    right_annotation = upset_right_annotation(comb_mat, add_numbers = TRUE)
+  )
+  
+  plot_list[[sce_id]] = plot
+  sce_id = sce_id + 1
+}
+
+pdf(file = paste0(out_path, time_stamp(), "plot_upset.pdf"),
+    width = 8, height = 6)
+
+for (plot in plot_list) ComplexHeatmap::draw(plot)
+
+dev.off()
+
+```
+

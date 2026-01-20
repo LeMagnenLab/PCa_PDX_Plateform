@@ -1,0 +1,513 @@
+---
+title: "8.P20-11 ADT (Only) treated (21 Days): Gene Set Enrichment Analysis"
+author: "Romuald Parmentier"
+date: "2025-04-09"
+output: html_document
+---
+
+```{r Prepare environment}
+
+# Libraries
+library(SingleCellExperiment)
+library(dplyr)
+library(ggplot2)
+library(clusterProfiler)
+library(fgsea)
+library(org.Hs.eg.db)
+library(enrichplot)
+library(msigdbr)
+library(Seurat)
+
+# Functions and palettes
+source("/scicore/home/wykopa75/GROUP/rparmentier/sc_RNAseq/Projects/Prostate/Xenograft_Models/Xenograft_Models_Custom_Functions.R")
+source("/scicore/home/wykopa75/GROUP/rparmentier/sc_RNAseq/Projects/Prostate/Xenograft_Models/Xenograft_Models_Color_Palettes.R")
+
+# Create output path
+out_path = create_exp_folder(
+  organ = "Prostate" ,
+  project = "Xenograft_Models",
+  samples_ID = "P20-11_21d_ADT",
+  exp = "9_Gene_Set_Enrichment_Analysis"
+)
+
+set.seed(123)
+
+```
+
+```{r Load sce object}
+
+file_path = get_exp_file_path(
+  organ = "Prostate" ,
+  project = "Xenograft_Models",
+  samples_ID = "P20-11_21d_ADT",
+  prev_exp = "7_Clustering",
+  pattern = "sce_obj_clustered.rds") 
+
+sce_obj = readRDS(file_path)
+
+```
+
+```{r Transform sce to Seurat object}
+
+seurat_obj = as.Seurat(
+  x = sce_obj, 
+  counts = "counts", 
+  data = "logcounts"
+)
+
+# Set the originalexp (aka "RNA" as the default assay)
+DefaultAssay(seurat_obj) = "originalexp"
+
+# Adds scale.data slot
+seurat_obj = ScaleData(seurat_obj)
+
+```
+
+# Load gene sets
+
+```{r Load MSifDB Gene Sets collections}
+
+# Load collections
+HALLMARK <- read.gmt("/scicore/home/wykopa75/GROUP/rparmentier/sc_RNAseq/Projects/Sequencing_Data/Gene_sets/MSigDB_HALLMARKS_hs_v2023_2.gmt")
+GOBP <- read.gmt("/scicore/home/wykopa75/GROUP/rparmentier/sc_RNAseq/Projects/Sequencing_Data/Gene_sets/MSigDB_C5_GO_Biological_Process.gmt")
+C2 = read.gmt("/scicore/home/wykopa75/GROUP/rparmentier/sc_RNAseq/Projects/Sequencing_Data/Gene_sets/MSigDB_C2_Curated_Gensets.gmt")
+
+list_collection <- list(
+  "C2" = C2,
+  "HALLMARK" = HALLMARK,
+  "GOBP" = GOBP
+)
+
+names_collection = names(list_collection)
+collection_df = data.table::rbindlist(list_collection)
+
+```
+
+```{r Retrieve specific gene_sets for testing}
+
+custom_gene_set = read.csv2(
+  "/scicore/home/wykopa75/GROUP/rparmentier/sc_RNAseq/Projects/Prostate/Xenograft_Models/Xenograft_Custom_Gene_Sets.csv",
+  header = T)
+
+```
+
+# ADT driven gene set enrichemnt
+-------------------------------
+
+```{r Load DEA gene file for ADT groups}
+
+file_path = get_exp_file_path(
+  organ = "Prostate",
+  project = "Xenograft_Models",
+  samples_ID = "P20-11_21d_ADT",
+  prev_exp = "8_Differential_Expression",
+  pattern = "Seurat_DE_Object_ADT_GSEA.rds")
+
+ADT_DE_Genes = readRDS(file_path)
+
+```
+
+## Perform GSEA
+
+```{r Scoring genes according FC and pval}
+
+sorted_ADT_DE_genes = ADT_DE_Genes %>%
+  mutate(score = (-log10(pmax(p_val_adj, 1e-300)) * avg_log2FC)) %>%
+  arrange(desc(score)) 
+
+gene_names = sorted_ADT_DE_genes$gene
+
+sorted_ADT_DE_genes = as.vector(sorted_ADT_DE_genes$score)
+names(sorted_ADT_DE_genes) = gene_names
+
+```
+
+```{r Perform GSEA}
+
+gse_df_list = list()
+gse_obj_list = list()
+
+# Perform GSEA for each collection
+for(collection_id in seq_along(list_collection)){
+  
+  collection <- list_collection[[collection_id]]
+  collection_name <- names_collection[collection_id]
+  
+  print(paste0("Performing GSEA for collection: ", collection_name))
+  
+  gse <- clusterProfiler::GSEA(
+    geneList = sorted_ADT_DE_genes,
+    TERM2GENE = collection,
+    pvalueCutoff = 0.05,
+    pAdjustMethod = "fdr",
+    minGSSize = 10, # At least 10 genes from gene List needs to be found in the gene set to consider the gene set
+    maxGSSize = 100, # Maximum 100 genes from gene List needs to be found in the gene set to consider the gene set (this exclude big gene sets)
+    by = "fgsea",
+    verbose = FALSE
+  )
+  
+  if (nrow(gse@result) == 0) {
+    print(paste0("No enriched terms found for collection: ", collection_name))
+    collection_id = collection_id + 1
+    next
+  }
+  
+  print(paste0(nrow(gse@result), " enriched terms found in collection: ", collection_name))
+  
+  # Store results
+  gse_df <- gse@result
+  gse_df$Collection <- collection_name
+  gse_df_list <- append(gse_df_list, list(gse_df))
+  gse_obj_list <- append(gse_obj_list, list(gse))
+  
+  collection_id = collection_id + 1
+  
+}
+
+# Make a single dataframe out of gsea results
+names(gse_obj_list) = lapply(gse_df_list,function(x){unique(x$Collection)})
+gse_obj_list_df = data.table::rbindlist(gse_df_list)
+
+# Export gse object
+
+saveRDS(
+  object = gse_obj_list,
+  file = paste0(out_path,"/ADT_effect/", time_stamp(),"gse_results_per_collection_ADT.rds")
+)
+
+saveRDS(
+  object = gse_obj_list_df,
+  file = paste0(out_path,"/ADT_effect/" ,time_stamp(),"gse_results_per_collection_ADT.csv")
+)
+
+```
+
+## Visualization 
+
+```{r Load ADT gse file}
+
+# Load all DE files and store in a list
+
+file_path = get_exp_file_path(
+  organ = "Prostate",
+  project = "Xenograft_Models",
+  samples_ID = "P20-11_21d_ADT",
+  prev_exp = "9_Gene_Set_Enrichment_Analysis/ADT_effect",
+  pattern = "gse_results_per_collection_ADT.rds")
+
+gse_obj_list = readRDS(file_path)
+
+```
+
+### Dotplots
+
+```{r GSEA dotplot}
+
+for (collection_id in seq_along(gse_obj_list)) {
+  
+  collection_name <- names(gse_obj_list)[collection_id]
+  gse = gse_obj_list[[collection_name]]
+  
+  print(paste0("Generating plot for collection: ", collection_name))
+  
+  # using .sign assigns positive NES score as "activated" 
+  # Positive NES is led by genes enriched at the top of the ranked list 
+
+  plot <- dotplot(
+    gse,
+    split = ".sign") +
+    facet_grid(. ~ .sign) +
+    ggtitle(
+      label = paste0(collection_name, ": " , "Activated/Suppressed in DHT0 compared to DHT1" )) +
+    theme(axis.text.y = element_text(size = 8))
+  
+  # Save the plot
+  ggsave(
+    plot = plot,
+    filename = paste0(out_path, "/ADT_effect/",time_stamp(), "plot_Dotplot_", collection_name,"_ADT.pdf"),
+    device = "pdf",
+    width = 9,
+    height = 6
+  )
+  
+}
+
+```
+
+### GSEA plots
+
+--- On enriched pathways
+
+```{r GSEA ranked plot}
+
+# Loop through each unique pathway
+for (pathway in unique(gse_obj_list_df$ID)) {
+  
+  # Extract collection name
+  collection_name = sub(x = pathway, pattern = "_.*", replacement =  "")
+  
+  # Load the GSEA object corresponding to the collection
+  pathway_gse = gse_obj_list[[collection_name]]
+  
+  if(!is.null(pathway_gse)){
+    
+    # Plot enrichment for significant pathways
+    plot_enrich = enrichplot::gseaplot2(
+      x = pathway_gse,
+      geneSetID = pathway,
+      pvalue_table = TRUE,
+      title = paste0("DHT0 ranked FC:  ", pathway)
+    )
+    
+    # Save the enrichment plot
+    ggsave(
+      plot = plot_enrich,
+      filename = paste0(out_path,"/ADT_effect/" ,time_stamp(), "plot_GSEA_", pathway, "_ADT.pdf"),
+      device = "pdf",
+      width = 13,
+      height = 9
+    )
+    
+    
+  }
+  
+  if (is.null(pathway_gse)) next
+  
+}
+
+
+```
+
+--- On targeted pathways
+
+```{r Perform and visualize GSEA with ClusterProfiler}
+
+for(panel in unique(custom_gene_set$term)){
+  
+  print(panel)
+  
+  panel_gene_list = custom_gene_set %>% 
+    filter(term == panel)
+  
+  gse <- clusterProfiler::GSEA(
+    geneList = sorted_ADT_DE_genes,
+    TERM2GENE = panel_gene_list,
+    pvalueCutoff = Inf, # No pValue Cutoff to be able to observe ranking of every signature
+    pAdjustMethod = "fdr",
+    minGSSize = 1, # No exclusion of gene set because intersection with gene list doesn't meet some criteria
+    maxGSSize = 500, #  Vitually no exclusion of gene set because intersection with gene list doesn't meet some criteria
+    by = "fgsea",
+    verbose = FALSE
+  )
+  
+  
+  pdf(
+    file = paste0(out_path, "/ADT_effect/",time_stamp(), "plot_GSEA_Targeted_", panel, "_ADT.pdf"),
+    width = 10,height = 6 )
+  
+  # Visualize GSEAt
+  plot = gseaplot2(gse,
+                   geneSetID = 1,
+                   pvalue_table = T) 
+  
+  print(plot)
+  
+  dev.off()
+}
+
+
+```
+
+-----------------------------
+
+# Between clusters
+
+```{r Load clusters DE file}
+
+# Load all DE files and store in a list
+
+file_path = get_exp_file_path(
+  organ = "Prostate",
+  project = "Xenograft_Models",
+  samples_ID = "P20-11_21d_ADT",
+  prev_exp = "8_Differential_Expression",
+  pattern = "DE_table_clusters_main_markers.csv")
+
+DE_table_clusters_main_markers = read.csv(file_path)
+
+```
+
+## Perform GSEA
+
+```{r Perform GSEA}
+
+# Prepare table for compareCluster as described in compareCluster
+# No scoring here, works with top DE genes (min.pct = 0.5, avglog2FC = 0.5)
+
+DE_table_clusters_main_markers = DE_table_clusters_main_markers %>%
+  dplyr::select(gene, avg_log2FC, cluster)
+
+gse_obj_list = list()
+  gse_df_list = list()
+
+for(collection in seq_along(list_collection)){
+  
+  collection_name = names(list_collection)[collection]
+  print(paste0("Computing gse for ", collection_name))
+  collection_set = list_collection[[collection]]
+  
+  # Keep only GO terms with 10–300 genes (typical for BP)
+  term_sizes <- table(collection_set$term)
+  valid_terms <- names(term_sizes[term_sizes >= 10 & term_sizes <= 300])
+  collection_set_filtered <- collection_set[collection_set$term %in% valid_terms, ]
+  
+  gse <- compareCluster(
+    gene~cluster, 
+    data = DE_table_clusters_main_markers,
+    fun = 'enricher',
+    TERM2GENE = collection_set_filtered,
+    pvalueCutoff = 0.01,
+    qvalueCutoff = 0.05,
+    pAdjustMethod = "BH")
+  
+  # Store results
+  gse_df <- gse@compareClusterResult 
+  gse_df$Collection <- collection_name
+  
+  gse_obj_list[[collection_name]] = gse
+  gse_df_list[[collection_name]] = gse_df
+
+}
+
+
+# Make a single dataframe out of gsea results
+names(gse_obj_list) = lapply(gse_df_list, function(x){unique(x$Collection)})
+gse_obj_list_df = data.table::rbindlist(gse_df_list)
+
+# Export gse object
+
+out_path = create_exp_folder(
+  organ = "Prostate" ,
+  project = "Xenograft_Models",
+  samples_ID = "P20-11_21d_ADT",
+  exp = "9_Gene_Set_Enrichment_Analysis/clustering_effect_main_markers/"
+)
+
+saveRDS(
+  object = gse_obj_list,
+  file = paste0(out_path, time_stamp(),"gse_results_clustering_main_markers.rds")
+)
+
+saveRDS(
+  object = gse_obj_list_df,
+  file = paste0(out_path, time_stamp(),"gse_results_clustering_main_markers.csv")
+)
+
+
+```
+
+### Dotplots
+
+```{r Dotplot all cluster comparison}
+
+for (collection_id in seq_along(gse_obj_list)) {
+  
+  collection_name <- names(gse_obj_list)[collection_id]
+  gse = gse_obj_list[[collection_name]]
+  
+  GOBP_dotplot = dotplot(gse, font.size = 6,showCategory = 5)
+  
+  ggsave(plot = GOBP_dotplot,
+         filename = paste0(out_path,time_stamp(), "plot_Dotplot_",collection_name,"_clusters_main_markers.pdf"),
+         width = 12,
+         height = 8
+  )
+  
+}
+
+```
+
+```{r Perform and visualize GSEA with ClusterProfiler}
+
+for(panel in unique(custom_gene_set$term)){
+  
+  print(panel)
+  
+  panel_gene_list = custom_gene_set %>% 
+    filter(term == panel)
+  
+  gse <- clusterProfiler::GSEA(
+    geneList = sorted_cluster_5_DE_genes,
+    TERM2GENE = panel_gene_list,
+    pvalueCutoff = Inf, # No p-value treshold to see all the genes 
+    pAdjustMethod = "fdr",
+    minGSSize = 1, 
+    maxGSSize = 500, 
+    by = "fgsea",
+    verbose = FALSE
+  )
+  
+  if (nrow(gse@result) == 0) {
+    print(paste0("No enriched terms found for gene set: ", panel))
+    next
+  }
+  
+  pdf(
+    file = paste0(out_path, "/walktrap_effect/",time_stamp(), "plot_GSEA_Targeted_", panel, "_Walktrap_Cluster_5.pdf"),
+    width = 10,height = 6
+    )
+  
+  # Visualize GSEAt
+  plot = gseaplot2(gse,
+                   geneSetID = 1,
+                   pvalue_table = T)
+  
+  print(plot)
+  
+  dev.off()
+}
+
+```
+
+```{r Perform GSEA on all collection}
+
+# Perform GSEA
+##############
+
+term_sizes <- table(collection_df$term)
+valid_terms <- names(term_sizes[term_sizes >= 10 & term_sizes <= 300])
+collection_df <- collection_df[collection_df$term %in% valid_terms, ]
+
+gse <- compareCluster(
+  gene~cluster, 
+  data = DE_table_clusters_main_markers,
+  fun = 'enricher',
+  TERM2GENE = collection_df,
+  pvalueCutoff = 0.01,
+  qvalueCutoff = 0.05,
+  pAdjustMethod = "BH")
+
+gse_df <- gse@compareClusterResult 
+
+saveRDS(
+  object = gse,
+  file = paste0(out_path, time_stamp(),"gse_results_clustering_main_markers_all_collection.rds")
+)
+
+write.csv(x =  gse_df,
+  file = paste0(out_path, time_stamp(),"gse_results_clustering_main_markers_all_collection_table.csv")
+)
+
+# Plot
+######
+
+GOBP_dotplot = dotplot(gse, font.size = 6, showCategory = 5)
+
+ggsave(plot = GOBP_dotplot,
+       filename = paste0(out_path,time_stamp(), "plot_Dotplot_clusters_main_markers_all_collection.pdf"),
+       width = 12,
+       height = 8
+)
+
+```
+

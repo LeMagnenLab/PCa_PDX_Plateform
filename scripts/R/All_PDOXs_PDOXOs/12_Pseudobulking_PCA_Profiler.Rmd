@@ -1,0 +1,83 @@
+---
+title: "Untitled"
+author: "Romuald Parmentier"
+date: "2025-07-16"
+output: html_document
+---
+```{r Prepare environment, message = F}
+
+# Libraries
+
+library(SingleCellExperiment)
+library(muscat)
+library(dplyr)
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+library(biomaRt)
+library(ggplot2)
+
+# Functions and palettes
+source("/scicore/home/wykopa75/GROUP/rparmentier/sc_RNAseq/Projects/Prostate/Xenograft_Models/Xenograft_Models_Custom_Functions.R")
+source("/scicore/home/wykopa75/GROUP/rparmentier/sc_RNAseq/Projects/Prostate/Xenograft_Models/Xenograft_Models_Color_Palettes.R")
+
+# Create output path
+out_path = create_exp_folder(
+  organ = "Prostate" ,
+  project = "Xenograft_Models",
+  samples_ID = "All_PDOXs_PDOXOs",
+  exp = "12_PCA_Profiler"
+)
+
+```
+
+```{r Reload sce object if needed}
+
+file_path = get_exp_file_path(
+  organ = "Prostate",
+  project = "Xenograft_Models",
+  samples_ID = "All_PDOXs_PDOXOs",
+  prev_exp = "9_Signature_Scores",
+  pattern = "sce_obj_scored.rds") 
+
+sce_obj = readRDS(file = file_path)
+
+```
+
+
+```{r}
+
+
+```
+
+```{r Computing psudobulk sum of raw reads accross cells within samples}
+
+
+# Compute pseudobulk sum of all the reads among the different samples
+summed_counts <- aggregateData(sce_obj,
+                               assay = "counts", fun = "sum",
+                               by = "Clean_ID")
+
+aggregated_counts  = as_tibble(assay(summed_counts))
+aggregated_counts["Gene"] = rowData(summed_counts)["SYMBOL"][,1] # Gene ENSEMBL ID are located in the row Metadata
+aggregated_counts = aggregated_counts %>% relocate(Gene) # Start with the Gene column
+
+# Rounding all the values except for the "Gene" column to integers
+aggregated_counts <- aggregated_counts %>% 
+  mutate(across(-Gene, ~ round(., digits = 0)))
+
+# Export the table
+write.csv(
+  x = aggregated_counts,
+  file = paste0(out_path, time_stamp(), "table_PseudoBulked_", "sum", "_counts_all_samples.csv"),
+  row.names = F
+)
+
+# Export the summarized object
+saveRDS(
+  object = summed_counts,
+  file = paste0(out_path, time_stamp(), "pseudobulked_", sum, "_counts_summarized_sce.rds"))
+
+
+
+```
+

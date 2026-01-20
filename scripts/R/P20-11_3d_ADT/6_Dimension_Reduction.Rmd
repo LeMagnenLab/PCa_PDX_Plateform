@@ -1,0 +1,511 @@
+---
+title: "6. P20-11 ADT treated (3 Days): dimension reduction"
+author: "Romuald Parmentier"
+date: "2025-06-06"
+output: html_document
+---
+
+```{r Prepare environment, message = F}
+
+# Libraries
+library(SingleCellExperiment)
+library(dplyr)
+library(scran)
+library(scater)
+library(dplyr)
+
+# Functions and palettes
+source("/scicore/home/wykopa75/GROUP/rparmentier/sc_RNAseq/Projects/Prostate/Xenograft_Models/Xenograft_Models_Custom_Functions.R")
+source("/scicore/home/wykopa75/GROUP/rparmentier/sc_RNAseq/Projects/Prostate/Xenograft_Models/Xenograft_Models_Color_Palettes.R")
+
+# Create output path (adapted)
+out_path = create_exp_folder(
+  organ = "Prostate",
+  project = "Xenograft_Models",
+  samples_ID = "P20-11_3d_ADT",
+  exp = "6_Dimension_Reduction"
+)
+
+```
+
+# Prepare the data
+
+```{r Load the files}
+
+file_path = get_exp_file_path(
+  organ = "Prostate",
+  project = "Xenograft_Models",
+  samples_ID = "P20-11_3d_ADT",
+  prev_exp = "5_Cycle_Annotation",  
+  pattern = "sce_obj_cycle_annotated.rds")
+
+sce_obj = readRDS(file_path)
+
+```
+
+```{r variance modeling }
+
+#Fit a trend to the variance with respect to abundance across all genes 
+var_model = modelGeneVar(sce_obj)
+chosen.hvgs <- getTopHVGs(var_model, n = 1000)
+rowSubset(sce_obj, "hvg_top_n1000") <- chosen.hvgs
+
+# Visualizing the fit:
+fit_var <- metadata(var_model)
+
+{
+  
+  pdf(file = paste0(out_path, time_stamp(),"plot_var_vs_log_expression.pdf"),
+    width = 8,
+    height = 8)
+  
+  plot(fit_var$mean, 
+       fit_var$var, 
+       xlab="Mean of log-expression", 
+       ylab="Variance of log-expression")
+
+  curve(fit_var$trend(x), col="dodgerblue", add=TRUE, lwd=2)
+  
+   dev.off()
+
+}
+
+```
+
+```{r running PCA}
+
+sce_obj <- fixedPCA(sce_obj, rank = 100,
+                     name = "PCA_hvg_top_n1000" , 
+                     subset.row = rowSubset(sce_obj, "hvg_top_n1000"))
+
+```
+
+```{r Visualize PCA loadings}
+
+# Export PCA object
+PCA = reducedDim(sce_obj, "PCA_hvg_top_n1000")
+
+# Export PCA loadings
+PCA_loadings = attr(PCA, "rotation")
+
+# Make atiblle out of PCA loadings
+PC_loadings_df = as_tibble(PCA_loadings)
+colnames(PC_loadings_df) = paste0("PC", 1:ncol(PCA_loadings))
+rownames(PC_loadings_df) = rownames(PCA_loadings)
+
+# Reshape from wide to long format
+PC_loadings_df_long <- PC_loadings_df %>%
+  mutate(gene = rownames(PC_loadings_df)) %>%
+  tidyr::pivot_longer(cols = -gene, names_to = "PCs", values_to = "Loading")
+
+# Calculate absolute values and arrange in desce_objnding order
+top_PC_loadings <- PC_loadings_df_long %>%
+  mutate(abs_loadings = abs(Loading)) %>%
+  group_by(PCs) %>%
+  arrange(desc(abs_loadings)) %>%
+  slice_head(n = 20)   
+
+###################################
+### Plot 20 first PCS loadings ####
+###################################
+
+plot_list = list()
+PC_id = 1
+
+PCs = paste0("PC",1:20)
+
+for(PC in PCs){
+  
+  top_PC_loadings_subset = top_PC_loadings %>%
+    dplyr::filter(PCs == PC) %>%
+    mutate(gene = factor(gene, levels = gene[order(abs_loadings, decreasing = F)]))  # Set factor levels based on decreasing order of loadings
+  
+  # Create a bar plot for top PCA loadings, separated by principal components
+  plot = ggplot(top_PC_loadings_subset, aes(x = Loading , y = gene)) +  # 'gene' should be the identifier for rows/features
+    geom_col() +
+    labs(title = paste0("Top 20 loadings for PC", PC_id),
+         x = "Loadings",
+         y = "Gene") +
+    theme_minimal() 
+  
+  plot_list[[PC_id]] = plot
+  PC_id = PC_id + 1
+  
+}
+
+
+multiple_page_layout <- gridExtra::marrangeGrob(
+  grobs = plot_list, 
+  nrow = 3, ncol = 3)
+
+ggsave(
+  plot = multiple_page_layout,
+  filename = paste0(out_path,time_stamp(),"plots_20PCs_loadings.pdf"),
+  device = "pdf",
+  height = 12,
+  width = 10
+)
+
+
+```
+
+```{r Visualize variance captured by PCs, warning = FALSE}
+
+# Retrieve the % of variance explained by the PCS
+percent.var <- attr(PCA, "percentVar")
+
+###################################
+# Explained variance by each PC ###
+###################################
+
+{
+  
+  pdf(file = paste0(out_path, time_stamp(),"plot_explained_variance_PC.pdf"),
+      width = 8,
+      height = 8)
+  
+  plot(x = percent.var, 
+       main = paste0("Explained variance by PC)",
+                     "\n",
+                     "Gene subset for Dim reduction : 1000"), 
+       log = "y", 
+       xlab = "PC", 
+       ylab = "Variance explained (%)",
+       cex.main = 0.9)
+  
+  dev.off()
+  
+}
+
+###############################################
+# Cumulative variance explained by the PCs ###
+##############################################
+
+{
+  
+  pdf(file = paste0(out_path, time_stamp(),"plot_cum_variance_PC.pdf"),   
+      width = 8, 
+      height = 8) 
+  
+  x = 1:100
+  y = percent.var
+  plot(x,cumsum(y),
+       main = paste0("Cumulative sum of variance",
+                     "\n",
+                     "Gene subset for Dim reduction : 1000"),      
+       xlab = "Principal Components")
+  
+}
+```
+
+```{r Check correlation between seq depth and first PCS, warning = FALSE}
+
+#(If ~1, then remove it)
+
+# Store depth as the sum of counts for each cell (2 = sum of rows)
+depth <- apply(counts(sce_obj), 2, sum)
+
+paste("Correlation between PC1 and sequenging depth with the raw data is:",
+      round(abs(cor(PCA[,1], depth)), digits = 2))
+
+paste("Correlation between PC2 and sequenging depth with the raw data is:", 
+      round(abs(cor(PCA[,2], depth)), digits = 2))
+
+paste("Correlation between PC3 and sequenging depth with the raw data is:",
+      round(abs(cor(PCA[,3], depth)), digits = 2))
+
+paste("Correlation between PC4 and sequenging depth with the raw data is:", 
+      round(abs(cor(PCA[,4], depth)), digits = 2))
+
+# Print % of variance explained by X PCs
+########################################
+
+print(paste(round(max(cumsum(y)),0),"% of variance capture by the first", max(x), "PCs")) 
+print(paste(round(cumsum(y)[20],0),"% of variance capture by the first", 20, "PCs")) 
+print(paste(round(cumsum(y)[10],0),"% of variance capture by the first", 10, "PCs")) 
+
+
+# Creating a new entry with only the PC <= chosen.elbow
+reducedDim(sce_obj, "PCA.1-10") <- reducedDim(sce_obj)[,1:10]
+reducedDim(sce_obj, "PCA.1-20") <- reducedDim(sce_obj)[,1:20]
+reducedDim(sce_obj, "PCA.1-100") <- reducedDim(sce_obj)[,1:100]
+
+
+```
+
+```{r running and visualizing 4 first PCs of PCA}
+
+PC_list = list(
+  1:2, 
+  2:3, 
+  3:4)
+
+PC_names = list(
+  c("PCA_1", "PCA_2"),
+  c("PCA_2", "PCA_3"),
+  c("PCA_3", "PCA_4"))
+
+
+plot_list = list()
+
+for(PC_id in 1:length(PC_names)){
+  
+  # get metadata
+  md <- as_tibble(colData(sce_obj))
+  
+  # get embeddings from 2 first PC
+  coords <- as_tibble(reducedDim(sce_obj, "PCA_hvg_top_n1000"))[,PC_list[[PC_id]]]
+  colnames(coords) = PC_names[[PC_id]]
+  
+  # combine dataframes
+  md <- cbind(md, coords)
+  
+  ###############
+  ## Plotting ##
+  ###############
+  
+  PC_x = PC_names[[PC_id]][1]
+  PC_y = PC_names[[PC_id]][2]
+  
+  # plot
+  plot <- ggplot(md, aes(x = .data[[PC_x]], y = .data[[PC_y]] )) +
+    geom_point(aes(color = SampleGroup), size = 2, stroke = 0.5, alpha = 0.5) +
+    # scale_color_manual(values = pal.PDOX.PDOXO) +
+    labs(color = "SampleGroup") + 
+    ggtitle(
+      label =  paste("PCA without batch correction:",paste(PC_names[PC_id],collapse = "_")),
+      subtitle = "1000 HVG & 20PCs")
+  
+  plot = ggrastr::rasterise(plot, dpi =100, scale = 0.5)
+  
+  plot_list[[PC_id]] = plot
+  
+  
+}
+
+multiple_page_layout <- gridExtra::marrangeGrob(
+  grobs = plot_list, 
+  nrow = 2, ncol = 1)
+
+ggsave(
+  plot = multiple_page_layout,
+  filename = paste0(out_path,time_stamp(),"plots_PCs_No_BatchCorrection.pdf"),
+  device = "pdf",
+  width = 12,
+  height = 12,
+)
+
+```
+
+```{r Perform UMAP}
+
+sce_obj <- runUMAP(
+  sce_obj,
+  dimred = "PCA.1-20",
+  name = "UMAP_on_PCA.1-20",
+  n_neighbors = 300,
+  min_dist = 0.7)
+
+```
+
+# Visualization 
+
+## UMAPs
+
+```{r Make a tibble of metadata}
+
+# Reload sce object after dimension reduction if needed
+#######################################################
+
+file_path = get_exp_file_path(
+  organ = "Prostate",
+  project = "Xenograft_Models",
+  samples_ID = "P20-11_3d_ADT",
+  prev_exp = "6_Dimension_Reduction",  
+  pattern = "sce_obj_dim_reduced.rds")
+
+sce_obj = readRDS(file_path)
+
+# get metadata
+md <- as_tibble(colData(sce_obj))
+
+# get embeddings from 2 first PC
+coords <- as_tibble(reducedDim(sce_obj, "UMAP_on_PCA.1-20"))[,1:2]
+colnames(coords) = c("UMAP_1","UMAP_2")
+
+# combine dataframes
+md <- cbind(md, coords)
+
+md$Clean_ID = paste0(md$Model_ID,"_", md$Model_Mouse, "_", md$Model_Passage, "_", md$Model_System)
+
+```
+
+```{r Facetted UMAP colored per treatment}
+
+condition_id = 1
+plot_list = list()
+
+for (condition in unique(md$Multiplexing_Condition)) {
+  
+  md_other <- subset(md, Multiplexing_Condition != condition)
+  md_sample <- subset(md, Multiplexing_Condition == condition)
+  
+  plot <- ggplot() +
+    # Rasterise the first layer
+    ggrastr::rasterise(
+      geom_point(
+        data = md_other,
+        aes(x = UMAP_1, y = UMAP_2), 
+        fill = "grey", alpha = 0.4, size = 0.9,shape = 21, color = "gray10", stroke = 0.1
+      ), dpi = 200, scale = 0.5
+    ) +
+    # Rasterise the second layer
+    ggrastr::rasterise(
+      geom_point(
+        data = md_sample,
+        aes(x = UMAP_1, y = UMAP_2, fill = Multiplexing_Condition), 
+        alpha = 0.8, size = 2, shape = 21, color = "gray10", stroke = 0.2 
+      ), dpi = 200, scale = 0.6
+    ) +
+    ggtitle(label = condition,
+            subtitle = "Batch Correction (FastMNN applied)" ) +
+    theme_classic() +
+    scale_fill_manual(values = pal.treatment) +
+    guides(
+      alpha = "none",
+      size = "none"
+    )
+  
+  plot_list[[condition_id]] = plot
+  
+  condition_id = condition_id + 1
+  
+}
+
+multiple_page_layout <- gridExtra::marrangeGrob(
+  grobs = plot_list, 
+  nrow = 2, ncol = 1)
+
+ggsave(
+  plot = multiple_page_layout,
+  filename = paste0(out_path,time_stamp(),"plots_UMAP_Facetted_Treatment.pdf"),
+  device = "pdf",
+  width = 210,
+  height = 297,
+  unit = "mm")
+
+
+```
+
+```{r Single UMAP colored with treatment}
+
+# Calculate centroids for each cluster
+centroids <- md %>%
+  group_by(Multiplexing_Condition) %>%
+  summarise(
+    UMAP_1 = mean(UMAP_1),
+    UMAP_2 = mean(UMAP_2),
+    .groups = 'drop'
+  )
+
+# Move the labels abo ve the cluster for each of them
+
+plot <- ggplot() +
+  # Rasterise the first layer
+  ggrastr::rasterise(
+    geom_point(
+      data = md,
+      aes(x = UMAP_1, y = UMAP_2, fill = Multiplexing_Condition), 
+      alpha = 0.7, size = 1.3, 
+      shape = 21,
+      color = "gray10",
+      stroke = 0.2),  # Lighter stroke color (adjust as needed)),# Ensure shape supports fill and color
+    dpi = 300, scale = 1) +
+  scale_fill_manual(values = pal.treatment) +
+  theme_classic() +
+  # Add cluster numbers in the center of each cluster
+  # geom_text(
+  #   data = centroids,
+  #   aes(x = UMAP_1, y = UMAP_2, label = Clean_ID, color = Clean_ID),
+  #   size = 4,
+  #   fontface = "bold"
+  # ) +
+  # scale_color_manual(values = pal.PDOX.PDOXO.updated) +
+  guides(
+    fill = "none",
+    alpha = "none",
+    size = "none",
+    # color = "none"
+  )
+
+ggsave(
+  plot = plot,
+  filename = paste0(out_path,time_stamp(),"plot_UMAP_Single_Treatment.pdf"),
+  device = "pdf",
+  width = 10,
+  height = 8,
+)
+
+```
+
+```{r Single UMAP colored with cell cycle }
+
+# Calculate centroids for each cluster
+centroids <- md %>%
+  group_by(Multiplexing_Condition) %>%
+  summarise(
+    UMAP_1 = mean(UMAP_1),
+    UMAP_2 = mean(UMAP_2),
+    .groups = 'drop'
+  )
+
+# Move the labels abo ve the cluster for each of them
+
+plot <- ggplot() +
+  # Rasterise the first layer
+  ggrastr::rasterise(
+    geom_point(
+      data = md,
+      aes(x = UMAP_1, y = UMAP_2, fill = cell_cycle_phase), 
+      alpha = 0.8, size = 3, 
+      shape = 21,
+      color = "gray10",
+      stroke = 0.2),  # Lighter stroke color (adjust as needed)),# Ensure shape supports fill and color
+    dpi = 300, scale = 1) +
+  scale_fill_manual(values = pal_cell_cycle_phase) +
+  theme_classic() +
+  # Add cluster numbers in the center of each cluster
+  # geom_text(
+  #   data = centroids,
+  #   aes(x = UMAP_1, y = UMAP_2, label = Clean_ID, color = Clean_ID),
+  #   size = 4,
+  #   fontface = "bold"
+  # ) +
+  # scale_color_manual(values = pal.PDOX.PDOXO.updated) +
+  guides(
+    fill = "none",
+    alpha = "none",
+    size = "none",
+    # color = "none"
+  )
+
+ggsave(
+  plot = plot,
+  filename = paste0(out_path,time_stamp(),"plot_UMAP_Cell_Cycle.pdf"),
+  device = "pdf",
+  width = 6,
+  height = 6,
+)
+
+```
+
+# Export data
+
+```{r export the objects}
+
+# Export annotated sce_obj object
+saveRDS(
+  object = sce_obj,
+  file = paste0(out_path,time_stamp(), "sce_obj_dim_reduced.rds"))
+
+```

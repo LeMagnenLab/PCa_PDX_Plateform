@@ -1,0 +1,180 @@
+---
+title: "Comon step 1 : Fix empty droplets"
+author: "Romuald Parmentier"
+date: "2025-03-27"
+output: html_document
+---
+
+```{r}
+### Load Required Libraries
+library(SingleCellExperiment)
+library(scater)
+library(scuttle)
+library(DropletUtils)
+library(BiocParallel)
+library(ggplot2)
+library(patchwork)
+library(ggrastr)
+
+### Source Custom Functions
+source("/scicore/home/wykopa75/GROUP/rparmentier/sc_RNAseq/my_R_functions/Xenograft_Models_Custom_Functions.R")
+
+### Define sample IDs to process
+sample_ids <- c("rp12", "rp13", "rp27")
+lower_tresholds = c("rp12" = 1000, "rp13" = 1000 , "rp27" =  350)
+
+# Set filtering thresholds globally
+fdrThresh <- 0.001
+niters <- 50000
+
+```
+
+
+```{r}
+
+for (sample_id in sample_ids) {
+
+  message("Processing ", sample_id, "...")
+
+  # Set file paths
+  file_path <- file.path(
+    "/scicore/home/wykopa75/GROUP/rparmentier/sc_RNAseq/Projects/Prostate/Xenograft_Models/bin/Comon_Steps/0_Comon_STARSolo_Preprocessing/results/STARsolo",
+    sample_id,
+    "hg38_ensdb_110_sce.rds"
+  )
+
+  out_path <- file.path(
+    "/scicore/home/wykopa75/GROUP/rparmentier/sc_RNAseq/Projects/Prostate/Xenograft_Models/bin/Comon_Steps/0_Comon_STARSolo_Preprocessing/results/empty_drops",
+    sample_id
+  )
+
+  dir.create(out_path, recursive = TRUE, showWarnings = FALSE)
+
+  # Load SCE object
+  sce_obj <- readRDS(file_path)
+
+  # Pre-filter out barcodes with 0 counts
+  lib_sizes <- colSums(counts(sce_obj))
+  stats <- data.frame(total = ncol(sce_obj), zero = sum(lib_sizes == 0))
+  sce_obj <- sce_obj[, lib_sizes > 0]
+  
+  lowerThresh = lower_tresholds[sample_id]
+
+  # Run emptyDrops with reproducible seed
+  set.seed(100)
+  res <- DropletUtils::emptyDrops(
+    counts(sce_obj),
+    lower = lowerThresh,
+    niters = niters,
+    test.ambient = TRUE,
+    BPPARAM = MulticoreParam(workers = 4, RNGseed = 1234)
+  )
+
+  # Retry with more iterations if needed
+  mloop <- 0
+  while (sum(res$FDR > fdrThresh & res$Limited, na.rm = TRUE) > 0) {
+    mloop <- mloop + 1
+    if (mloop > 5) stop("Max iterations exceeded!")
+    niters <- 2 * niters
+    message("Increasing iterations to ", niters)
+    res <- DropletUtils::emptyDrops(
+      counts(sce_obj),
+      lower = lowerThresh,
+      niters = niters,
+      test.ambient = TRUE,
+      BPPARAM = MulticoreParam(workers = 4, RNGseed = 1234)
+    )
+  }
+
+  # Define retained barcodes
+  is.Cell <- which(res$FDR <= fdrThresh & res$Total > lowerThresh)
+  sce_obj_updated <- sce_obj[, is.Cell]
+  
+  sce_obj_updated
+
+  # Save filtered SCE
+  saveRDS(sce_obj_updated, file = file.path(out_path, "hg38_ensdb_110_sce.rds"))
+
+  # Save filtering stats
+  stats$retained <- length(is.Cell)
+  stats$estimated.empty <- ncol(sce_obj) - length(is.Cell)
+  write.table(stats, file = file.path(out_path, "empty_drops_stats.tsv"), sep = "\t", row.names = FALSE)
+
+  # Generate barcodeRanks object for QC
+  bcrank <- DropletUtils::barcodeRanks(counts(sce_obj), lower = lowerThresh)
+
+  # Save QC plots
+  pdf(file = file.path(out_path, "hg38_ensdb_110_sce_QC_plots.pdf"), width = 8.5, height = 11)
+
+  ## UMI density
+  gp0 <- ggplot(data = data.frame(Total = bcrank$total), aes(x = log10(Total))) +
+    geom_density(n = 128) +
+    scale_y_log10() +
+    labs(title = "Total UMI density (all droplets with at least 1 UMI)") +
+    theme_bw() +
+    theme(panel.grid.major = element_line(color='grey', linetype="dashed"))
+
+  ## Classical knee plot
+  df <- data.frame(Rank = bcrank$rank,
+                   Total = bcrank$total,
+                   Is.Empty = !(1:nrow(bcrank) %in% is.Cell))
+  df <- df[!duplicated(bcrank$rank),]
+
+  gp1 <- ggplot(data = df, aes(x=Rank, y=Total, colour=Is.Empty)) +
+    ggrastr::rasterize(geom_point()) +
+    geom_hline(yintercept=metadata(bcrank)$inflection, colour='darkgreen', linetype=2, size=1) +
+    geom_text(aes(y = metadata(bcrank)$inflection, x=15,
+                  label = sprintf("Inflection at %g, %d droplets retained",
+                                  metadata(bcrank)$inflection,
+                                  round(max(bcrank$rank[bcrank$total > as.integer(metadata(bcrank)$inflection)]))
+                  )),
+              colour = 'darkgreen', nudge_y = -0.2, size = 3) +
+    geom_hline(yintercept = metadata(bcrank)$knee, colour='dodgerblue', linetype=2, size=1) +
+    geom_text(aes(y = metadata(bcrank)$knee, x=15,
+                  label = sprintf("Knee at %g, %d droplets retained",
+                                  metadata(bcrank)$knee,
+                                  round(max(bcrank$rank[bcrank$total > as.integer(metadata(bcrank)$knee)]))
+                  )),
+              colour='dodgerblue', nudge_y = 0.2, size = 3) +
+    scale_x_log10() + scale_y_log10() +
+    labs(title = "'Knee-plot' (not used for calling cells)") +
+    theme_bw() +
+    theme(panel.grid.major = element_line(color='grey', linetype="dashed"))
+
+  print(wrap_plots(gp0, gp1, nrow = 2))
+
+  ## Total vs likelihood
+  df2 <- data.frame(Total = res$Total, LogProb = res$LogProb, is.Empty = res$FDR < fdrThresh)
+
+  gp2 <- ggplot(data = df2, aes(x = Total, y = -LogProb, color = is.Empty)) +
+    ggrastr::rasterize(geom_point(pch = 1)) +
+    geom_vline(xintercept = lowerThresh, linetype=2, linewidth = 1) +
+    scale_x_log10() +
+    labs(title = sprintf("emptyDrops: %d > 0 UMI, %d < %d UMI, %d non-empty",
+                         stats$total - stats$zero,
+                         sum(res$Total <= lowerThresh),
+                         lowerThresh,
+                         length(is.Cell))) +
+    theme_bw() +
+    theme(panel.grid.major = element_line(color='grey', linetype="dashed"))
+
+  ## P-value histogram
+  df3 <- data.frame(PValue = res$PValue[res$Total <= lowerThresh & res$Total > 0])
+
+  gp3 <- ggplot(data = df3, aes(PValue)) +
+    geom_histogram(col="darkgrey", fill="grey", bins=30) +
+    labs(title = sprintf("Are droplets with UMI < %d compatible with ambient profile (uniform p-value distribution)?", lowerThresh),
+         x = "PValue", y = "Frequency") +
+    theme_bw()
+
+  print(wrap_plots(gp2, gp3, nrow = 2))
+
+  dev.off()
+  
+}
+
+```
+
+
+
+

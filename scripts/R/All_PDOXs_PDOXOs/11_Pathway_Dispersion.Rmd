@@ -1,0 +1,886 @@
+---
+title: "11. Pagoda dispersion score evaluation"
+author: "Romuald Parmentier"
+date: "2025-07-08"
+output: html_document
+---
+
+```{r Prepare environment, message = F}
+
+# Libraries
+
+library(SingleCellExperiment)
+library(Seurat)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(ggbeeswarm)
+library(gridExtra)
+library(scater)
+library(org.Hs.eg.db)
+library(ComplexHeatmap)
+library(ggpubr)
+library(AnnotationHub)
+library(msigdbr)
+library(pagoda2)
+library(scde)
+library(colorRamps)
+library(stringr)
+library(treemap)
+library(treemapify)
+
+
+# Functions and palettes
+source("/scicore/home/wykopa75/GROUP/rparmentier/sc_RNAseq/Projects/Prostate/Xenograft_Models/Xenograft_Models_Custom_Functions.R")
+source("/scicore/home/wykopa75/GROUP/rparmentier/sc_RNAseq/Projects/Prostate/Xenograft_Models/Xenograft_Models_Color_Palettes.R")
+
+# Create output path
+out_path = create_exp_folder(
+  organ = "Prostate" ,
+  project = "Xenograft_Models",
+  samples_ID = "All_PDOXs_PDOXOs",
+  exp = "11_Pathway_Activation"
+)
+
+```
+
+```{r Reload sce object if needed}
+
+file_path = get_exp_file_path(
+  organ = "Prostate",
+  project = "Xenograft_Models",
+  samples_ID = "All_PDOXs_PDOXOs",
+  prev_exp = "9_Signature_Scores",
+  pattern = "sce_obj_scored.rds") 
+
+sce_obj = readRDS(file = file_path)
+
+```
+
+# Pagoda full dataset
+
+## Pre-processing step
+
+```{r Preprocessing the object}
+
+# Extract raw counts
+counts_matrix <- as.matrix(counts(sce_obj))
+
+# Create pagoda object
+pagoda_obj <- Pagoda2$new(counts_matrix,
+                          log.scale = TRUE)
+
+# Variance transformation
+pagoda_obj$adjustVariance(gam.k = 10, plot = TRUE)
+
+# Compute PCA on 1000 HVG and 20 dimensions
+pagoda_obj$calculatePcaReduction(nPcs = 20, n.odgenes = 1000)
+
+# Compute UMAP (simialr parameters to those used for sce)
+pagoda_obj$getEmbedding(type='PCA', embeddingType='UMAP', n_neighbors = 300, min_dist = 0.7 , verbose=FALSE)
+
+# Add clean ID to clusters
+Clean_ID = factor(sce_obj$Clean_ID, levels = unique(sce_obj$Clean_ID))
+names(Clean_ID) = rownames(pagoda_obj$counts)
+pagoda_obj$clusters$PCA$Clean_ID = Clean_ID
+
+```
+
+```{r Visual check of UMAP}
+
+pagoda_obj$plotEmbedding(
+  type = "PCA",
+  embeddingType = "UMAP",
+  groups = pagoda_obj$clusters$PCA$Clean_ID,
+  mark.groups = TRUE,
+  shuffle.colors = FALSE,
+  font.size = 3,
+  alpha = 0.3,
+  title = "UMAP par Clean_ID",
+  plot.theme = theme_bw() +
+    theme(plot.title = element_text(hjust = 0.5))
+)
+
+```
+
+## Pathway dispersion analysis
+
+### Get set environement preparation
+
+```{r Prepare gene set for pathway dispersion analysis}
+
+# 1. Load gene sets
+HALLMARK = clusterProfiler::read.gmt("/scicore/home/wykopa75/GROUP/rparmentier/sc_RNAseq/Projects/Sequencing_Data/Gene_sets/MSigDB_HALLMARKS_hs_v2023_2.gmt")
+# C2 = clusterProfiler::read.gmt("/scicore/home/wykopa75/GROUP/rparmentier/sc_RNAseq/Projects/Sequencing_Data/Gene_sets/MSigDB_C2_Curated_Gensets.gmt")
+# BP = clusterProfiler::read.gmt("/scicore/home/wykopa75/GROUP/rparmentier/sc_RNAseq/Projects/Sequencing_Data/Gene_sets/MSigDB_C5_GO_Biological_Process.gmt")
+
+#######
+# SYMBOL ID
+########
+
+# Fusionner les trois tables
+gene_sets_df <- bind_rows(
+  # BP,
+  # C2,
+  HALLMARK)
+
+# Compter la taille de chaque set
+set_sizes <- gene_sets_df %>%
+  group_by(term) %>%
+  summarise(n = n_distinct(gene), .groups = "drop")
+
+# Filtrer entre 10 et 300 gènes
+valid_sets <- set_sizes %>%
+  filter(n >= 30 & n <= 200) %>%
+  pull(term)
+
+filtered_df <- gene_sets_df %>% filter(term %in% valid_sets)
+
+# Regrouper par nom de set → list
+gene_sets_list <- gene_sets_df %>%
+  group_by(term) %>%
+  summarise(genes = list(unique(gene)), .groups = "drop") %>%
+  tibble::deframe()  # transforme en named list
+
+# Convertir en environnement
+gene_set_env <- list2env(gene_sets_list, envir = new.env())
+
+```
+
+```{r Pathway dispersion}
+
+# Pathway overdispersion -- required for web
+results_table = pagoda_obj$testPathwayOverdispersion(
+  setenv = gene_set_env, verbose = T, 
+  correlation.distance.threshold = 0.9, 
+  recalculate.pca = T,
+  n.cores = 1,
+  min.pathway.size = 10, # Minimum number of gene that need to be detected within a gene set
+  max.pathway.size = 300) # Maximum number of gene
+
+
+# Save object
+saveRDS(
+  object = pagoda_obj,
+  file = paste0(out_path,time_stamp(), "pagoda_obj_path_disp.rds"))
+
+```
+
+## Visualization
+
+```{r Reload the pagoda object}
+
+file_path = get_exp_file_path(
+  organ = "Prostate",
+  project = "Xenograft_Models",
+  samples_ID = "All_PDOXs_PDOXOs",
+  prev_exp = "11_Pathway_Activation",
+  pattern = "pagoda_obj_path_disp.rds") 
+
+pagoda_obj = readRDS(file = file_path)
+
+```
+
+```{r Extract score per cell (dispersion z-scores) of top 50 pathways}
+
+# Get top pathways
+##################
+
+# Extract gene set names
+pathway_names <- names(pagoda_obj$misc$pwpca)
+
+# Extract dispersion z-scores
+dispersion_scores <- sapply(pathway_names, function(pw) {
+  pagoda_obj$misc$pwpca[[pw]]$d[1]
+})
+
+# Get top 50 pathways
+top_pathways <- names(sort(dispersion_scores, decreasing = TRUE))[1:50]
+
+#####################
+# Extract cell scores
+#####################
+
+# Extract scores per cell
+
+pathway_scores_df = tibble(cell_id = rownames(pagoda_obj$counts))
+
+
+for (pathway in top_pathways) {
+  
+  colname <- paste0(pathway, "_pagoda_score")
+  scores  <- pagoda_obj$misc$pwpca[[pathway]]$xp$scores[1, ]
+  
+  # Ajouter la colonne avec nom dynamique
+  pathway_scores_df <- pathway_scores_df %>%
+    mutate(!!colname := scores)  # use named vector lookup
+}
+
+```
+
+```{r Add score of sce_obj}
+
+md = as_tibble(colData(sce_obj))
+md <- md %>% bind_cols(dplyr::select(pathway_scores_df, -cell_id))
+
+colData(sce_obj) = DataFrame(md)
+
+```
+
+### Violin plot 
+
+```{r Violin plots split by samples}
+
+gene_signature_scores = colnames(md)[which(grepl(x = colnames(md), pattern = "pagoda_score"))]
+pathway_id = 1
+
+plot_list = list()
+
+for(gene_signature in gene_signature_scores){
+  
+  plot =  ggplot(md, aes(x = Short_ID, y = .data[[gene_signature]], fill = Model_System)) +
+    geom_violin(alpha = 0.8, position = position_dodge(width = 0.8), scale = "width") +
+    # geom_quasirandom(size = 0.3, color = "black", alpha = 0.5) + # Allows to fill Violin plot with dots in a qusi random way
+    geom_boxplot(width = 0.1, position = position_dodge(width = 0.8), alpha = 0.5) +    
+    geom_hline(yintercept = 0, linetype = "dotted", color = "black", size = 0.8) +  # Add 0 line # Optional: Add boxplot overlay
+    scale_fill_manual(values = c("Xenograft_Organoids" = "#ADD8E6", "Xenograft" = "#FFD1DC")) +
+    labs(
+      title = paste0("Signature score: ", gene_signature),
+      x = "Sample",
+      y = "log2(UMI)",
+      fill = "Data Type"
+    ) +
+    # theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 6),
+      strip.text = element_text(size = 12),
+      
+      # Strip with background and border
+      strip.background = element_rect(
+        fill = "grey90",
+        color = "grey40",   # Border color
+        linewidth = 0.5     # Optional: border thickness
+      ),
+      
+      # Transparent plot/panel backgrounds
+      panel.background = element_rect(fill = "transparent", color = NA),
+      plot.background = element_rect(fill = "transparent", color = NA),
+      
+      # Grey grid
+      panel.grid.major = element_line(color = "grey90"),
+      panel.grid.minor = element_line(color = "grey95"),
+      
+      # Grey panel border
+      panel.border = element_rect(color = "grey60", fill = NA, linewidth = 0.5)
+    )+
+    facet_grid(~Model_ID, scales = "free_x")
+  
+  plot_list[[pathway_id]] = plot
+  
+  pathway_id = pathway_id + 1
+  
+}
+
+multiple_page_layout <- gridExtra::marrangeGrob(
+  grobs = plot_list, 
+  nrow = 1, ncol = 1)
+
+ggsave(
+  plot = multiple_page_layout,
+  filename = paste0(out_path,time_stamp(),"plots_violin_facetted_gene_culture_Enriched_Pathways_Split_Model_ID.pdf"),
+  device = "pdf",
+  width = 12,
+  height = 8)
+
+```
+
+# Pagoda activation score per patient
+
+```{r Preprocessing object per patient}
+
+pagoda_obj_patient_list = list()
+plot_list = list()
+patient_id = 1
+
+for(patient_name in c("P20-11","P20-23")){
+  
+  # Subset sce obj per patient (removing cycling cells)
+  cells_to_keep = which(grepl(x = sce_obj$Clean_ID, pattern = patient_name) & sce_obj$cell_cycle_phase == "G1")
+  sce_obj_patient = sce_obj[, cells_to_keep]
+  
+  # Extract raw counts
+  counts_matrix <- as.matrix(counts(sce_obj_patient))
+  
+  # Create pagoda object
+  pagoda_obj <- Pagoda2$new(counts_matrix,
+                            log.scale = TRUE)
+  
+  # Variance transformation
+  pagoda_obj$adjustVariance(gam.k = 10, plot = TRUE)
+  
+  # Compute PCA on 1000 HVG and 20 dimensions
+  pagoda_obj$calculatePcaReduction(nPcs = 20, n.odgenes = 1000)
+  
+  # Compute UMAP (simialr parameters to those used for sce)
+  pagoda_obj$getEmbedding(type='PCA', embeddingType='UMAP', n_neighbors = 300, min_dist = 0.7 , verbose=FALSE)
+  
+  # Add clean ID to clusters
+  Clean_ID = factor(sce_obj_patient$Clean_ID, levels = unique(sce_obj_patient$Clean_ID))
+  names(Clean_ID) = rownames(pagoda_obj$counts)
+  pagoda_obj$clusters$PCA$Clean_ID = Clean_ID
+  
+  # Draw UMAP colored by walktrap clustering
+  plot = pagoda_obj$plotEmbedding(
+    type = "PCA",
+    embeddingType='UMAP',
+    show.legend = FALSE, 
+    mark.groups = TRUE, 
+    min.cluster.size = 50, 
+    shuffle.colors = FALSE, 
+    font.size = 3,
+    alpha = 0.3, 
+    title = 'clusters (largeVis)', 
+    plot.theme=theme_bw() + 
+      theme(plot.title = element_text(hjust = 0.5)))
+  
+  
+  pagoda_obj_patient_list = append(x = pagoda_obj_patient_list, values = pagoda_obj)
+  names(pagoda_obj_patient_list)[patient_id] = patient_name
+  
+  plot_list[[patient_id]] = plot 
+  patient_id = patient_id + 1
+  
+}
+
+names(pagoda_obj_patient_list) 
+
+multiple_page_layout <- gridExtra::marrangeGrob(
+  grobs = plot_list, 
+  nrow = 1, ncol = 2)
+
+ggsave(
+  plot = multiple_page_layout,
+  filename = paste0(out_path,time_stamp(),"plots_UMAP_split_Model_ID.pdf"),
+  device = "pdf",
+  width = 12,
+  height = 8)
+
+```
+
+## Pathway dispersion analysis
+
+```{r Pathway dispersion per patient}
+
+patient_id = 1
+
+for(pagoda_patient in pagoda_obj_patient_list){
+  
+  patient_name = names(pagoda_obj_patient_list)[patient_id]
+  
+  # Pathway overdispersion -- required for web
+  results_table = pagoda_patient$testPathwayOverdispersion(
+    setenv = gene_set_env, verbose = T, 
+    correlation.distance.threshold = 0.9, 
+    recalculate.pca = T,
+    n.cores = 1,
+    min.pathway.size = 10, # Minimum number of gene that need to be detected within a gene set
+    max.pathway.size = 300, # Maximum number of gene
+    return.table = T) 
+  
+  # Save object
+  saveRDS(
+    object = pagoda_patient,
+    file = paste0(out_path,time_stamp(), "pagoda_obj_disp_", patient_name,".rds"))
+  
+  write.csv2(
+    x = results_table,
+    file = paste0(out_path,time_stamp(), "pagoda_disp_result_table_", patient_name,".csv"))
+  
+  patient_id = patient_id + 1
+  
+}
+
+```
+
+## Visualization
+
+```{r Reload the pagoda object}
+
+file_path = get_exp_file_path(
+  organ = "Prostate",
+  project = "Xenograft_Models",
+  samples_ID = "All_PDOXs_PDOXOs",
+  prev_exp = "11_Pathway_Activation",
+  pattern = "pagoda_obj_disp_P20-") 
+
+# Load both object and store them in a list
+pagoda_obj_patient_list = sapply(file_path, readRDS)
+
+names(pagoda_obj_patient_list) = c("P20-11", "P20-23")
+
+```
+
+```{r Extract dispersion score per pathway and PC1 projection per cell }
+
+sce_obj_patient_list = list()
+top_pathway_list = list()
+
+for(patient_id in seq_along(pagoda_obj_patient_list)){
+  
+  pagoda_patient = pagoda_obj_patient_list[[patient_id]]
+  patient_name = names(pagoda_obj_patient_list)[patient_id]
+  
+  # Subset sce obj per patient (removing cycling cells)
+  cells_to_keep = which(grepl(x = sce_obj$Clean_ID, pattern = patient_name) & sce_obj$cell_cycle_phase == "G1")
+  sce_obj_patient = sce_obj[, cells_to_keep]
+  
+  #############################
+  # Get dispersion per pathways
+  #############################
+  
+  # Extract gene set names
+  pathway_names <- names(pagoda_patient$misc$pwpca)
+  
+  # Extract dispersion explained by the pathway (on its own PCA)
+  explained_variance <- sapply(pathway_names, function(pw) {
+    pagoda_patient$misc$pwpca[[pw]]$xp$d
+  })
+  
+  # Get top pathway and store in a list
+  top_pathways = sort(explained_variance, decreasing = TRUE)
+  top_pathway_list[[patient_name]] = top_pathways
+  
+  ##################################
+  # Extract PC1 projection per cell 
+  ################################
+  
+  pathway_scores_df = tibble(cell_id = rownames(pagoda_patient$counts))
+  
+  for (pathway in names(top_pathways)) {
+    
+    colname <- paste0(pathway, "_pagoda_score")
+    scores  <- pagoda_patient$misc$pwpca[[pathway]]$xp$scores[1, ]
+    
+    # Add column to df (dynamical name)
+    pathway_scores_df <- pathway_scores_df %>%
+      mutate(!!colname := scores)  # use named vector 
+  }
+  
+  ###############
+  ## Add them to sce and append list
+  #############
+  
+  md = as_tibble(colData(sce_obj_patient))
+  md <- md %>% bind_cols(dplyr::select(pathway_scores_df, -cell_id))
+  
+  colData(sce_obj_patient) = DataFrame(md)
+  sce_obj_patient_list[[patient_name]] = sce_obj_patient
+  
+}
+
+
+```
+
+### Violin plot: PC1 projection per cell for each pathway 
+
+```{r Violin plots split by samples}
+
+for(sce_obj_patient in sce_obj_patient_list){
+  
+  patient_name = unique(sce_obj_patient$Model_ID)
+  md = as_tibble(colData(sce_obj_patient))
+  
+  # get signature scores
+  gene_signature_scores = paste0(names(top_pathway_list[[patient_name]]), "_pagoda_score")
+  gene_signature_scores = intersect(colnames(md), gene_signature_scores)
+  
+  pathway_id = 1
+  plot_list = list()
+  
+  for(gene_signature in gene_signature_scores){
+    
+    plot =  ggplot(md, aes(x = Short_ID, y = .data[[gene_signature]], fill = Model_System)) +
+      geom_violin(alpha = 0.8, position = position_dodge(width = 0.8), scale = "width") +
+      geom_boxplot(width = 0.1, position = position_dodge(width = 0.8), alpha = 0.5) +    
+      geom_hline(yintercept = 0, linetype = "dotted", color = "black", linewidth = 0.8) +  # Add 0 line # Optional: Add boxplot overlay
+      scale_fill_manual(values = c("Xenograft_Organoids" = "#ADD8E6", "Xenograft" = "#FFD1DC")) +
+      labs(
+        title = paste0(patient_name, "--> Signature score: ", gene_signature),
+        x = "Sample",
+        y = "log2(UMI)",
+        fill = "Data Type"
+      ) +
+      # theme_minimal() +
+      theme(
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 6),
+        strip.text = element_text(size = 12),
+        
+        # Strip with background and border
+        strip.background = element_rect(
+          fill = "grey90",
+          color = "grey40",   # Border color
+          linewidth = 0.5     # Optional: border thickness
+        ),
+        
+        # Transparent plot/panel backgrounds
+        panel.background = element_rect(fill = "transparent", color = NA),
+        plot.background = element_rect(fill = "transparent", color = NA),
+        
+        # Grey grid
+        panel.grid.major = element_line(color = "grey90"),
+        panel.grid.minor = element_line(color = "grey95"),
+        
+        # Grey panel border
+        panel.border = element_rect(color = "grey60", fill = NA, linewidth = 0.5)
+      )
+    
+    plot_list[[pathway_id]] = plot
+    
+    pathway_id = pathway_id + 1
+    
+  }
+  
+  multiple_page_layout <- gridExtra::marrangeGrob(
+    grobs = plot_list, 
+    nrow = 1, ncol = 1)
+  
+  ggsave(
+    plot = multiple_page_layout,
+    filename = paste0(out_path,time_stamp(),"plots_violin_facetted_gene_culture_Enriched_Pathways_Split_", patient_name,".pdf"),
+    device = "pdf",
+    width = 12,
+    height = 8)
+  
+}
+
+```
+
+### Heatmap of pathway dispersion scores
+
+```{r Extract overall dispersion per pathway}
+
+# Map function to make a tibble out of top pathway list per patient
+###################################################################
+
+dispersion_scores_df <- Map(function(patient_dispersion_scores, patient_name) {
+  
+  tibble(
+    term = names(patient_dispersion_scores),
+    dispersion_scores = patient_dispersion_scores,
+    patient = patient_name
+  )
+  
+}, 
+
+# Argument of the function
+top_pathway_list, # First argument of Map functiomn
+names(top_pathway_list) # second argument on Map function
+)
+
+# Combine tibles into one
+#########################
+
+dispersion_scores_df <- dplyr::bind_rows(dispersion_scores_df)
+dispersion_scores_df_wide = pivot_wider(data = dispersion_scores_df, values_from = dispersion_scores, names_from = patient )
+dispersion_scores_df_wide = dispersion_scores_df_wide %>% mutate(term = str_remove(term, "^HALLMARK_"))
+
+```
+
+```{r Heatmap}
+
+# Convert as a matrix
+dispersion_scores_mtx = as.matrix(dispersion_scores_df_wide[,c(2,3)]) 
+rownames(dispersion_scores_mtx) = dispersion_scores_df_wide$term
+
+{
+  
+  pdf(
+    file = paste0(out_path, time_stamp(), "heatmap_dispersion_scores.pdf"),
+    width = 12, height = 4
+  )
+  
+  print(Heatmap(
+    matrix = t(dispersion_scores_mtx),  # << FLIP de la matrice
+    cluster_rows = F,
+    cluster_columns = T,
+    show_column_dend = F,
+    show_column_names = TRUE,       # Les noms des pathways
+    column_names_rot = -90,          # Rotation des noms des pathways
+    show_row_dend = FALSE,
+    use_raster = TRUE,
+    col = paletteer_c("grDevices::RdYlGn", 30,direction = -1),
+    row_names_gp = grid::gpar(fontsize = 8),  # patients en ligne
+    column_names_gp = grid::gpar(fontsize = 8),
+    heatmap_legend_param = list(title = "Dispersion score")
+  ))
+  
+  dev.off()
+  
+}
+
+
+```
+
+## DE genes in dispersed pathway
+
+- Rerun everything but the dispersion score calculation otherwise it doesn't work
+
+```{r Get DE genes in dispersed pathways}
+
+## ----   Load global DE genes between PDOX and PDOX  ----
+
+file_path = get_exp_file_path(
+  organ = "Prostate",
+  project = "Xenograft_Models",
+  samples_ID = "All_PDOXs_PDOXOs",
+  prev_exp = "7_Differential_Expression",
+  pattern = "Seurat_DiffExp_Object_Marker_List_GLOBAL.rds") 
+
+markers <- readRDS(file_path)
+markers$gene = rownames(markers)
+
+## ----  Get top dispersed pathways and extract DE genes ----
+
+dispersion_scores_df_mean = dispersion_scores_df %>% 
+  group_by(term) %>% 
+  summarise(mean_disp = mean(dispersion_scores)) %>%
+  arrange(desc(mean_disp)) %>%
+  slice_head(n = 20) %>%
+  pull(term)
+
+top_disp_genes_df <- HALLMARK %>% 
+  filter(term %in% dispersion_scores_df_mean) %>% 
+  filter(gene %in% rownames(markers)) %>%
+  mutate(term = str_remove(term, "^HALLMARK_")) 
+
+top_disp_genes_df = top_disp_genes_df %>% 
+  left_join(y = markers, by = "gene") %>%
+  group_by(term) %>%
+  filter(abs(avg_log2FC) > 1.5) %>%
+  mutate(pct_gene_up_PDOXO = sum(avg_log2FC > 0, na.rm = TRUE) / n() * 100) %>%
+  arrange(pct_gene_up_PDOXO, desc(avg_log2FC), pct.1, pct.2) 
+
+## ---- Export top dispersed DE genes tale  ----
+
+write.csv(
+  x = top_disp_genes_df,
+  file = paste0(out_path,time_stamp(), "top_dispersed_patway_DE_Genes.csv"), row.names = F)
+
+```
+
+```{r TreeMap plot: colored by pathway - sized by nb DE genes - fontsized by FC}
+
+
+top_disp_genes_df <- top_disp_genes_df %>%
+  mutate(
+    capped_log2FC = pmin(pmax(avg_log2FC, -5), 5),  # Cap between -2 and 2
+    label_size = scales::rescale(capped_log2FC, to = c(10, 15))  # Rescale to font size 3–7
+  ) %>%
+  group_by(term) %>%
+  mutate(n_gene = n())
+
+plot = ggplot(top_disp_genes_df, aes(
+  area = n_gene,
+  fill = term,
+  label = gene,
+  subgroup = term  # Grouping per hallmark term
+)) +
+  geom_treemap(colour = NA) +
+   geom_treemap_text(mapping = aes(size = label_size, fontface = "bold"),
+   # geom_treemap_text(size = 10,
+    colour = "black",
+    place = "bottom",
+    grow = F,
+    reflow = F,
+    min.size = 1  # << Fixed size for gene labels
+  ) +
+    geom_treemap_subgroup_text(
+    place = "topleft",
+    fontface = "bold",
+    grow = FALSE,
+    reflow = F,
+    size = 10,
+    min.size = 1,   # Fixed small size for term label
+    colour = "white"
+  ) +
+  scale_fill_paletteer_d("ggthemes::Tableau_20") +
+  theme(legend.position = "none")
+  theme_void()
+  
+ggsave(
+  device = "svg",
+  plot = plot,
+  filename = paste0(out_path,time_stamp(),"Treemap_DE_genes_Dispersed_Pathway.svg"),
+  width = 4 ,
+  height = 4)
+
+```
+
+```{r Heatmap plot: DE genes }
+
+# Global variables
+patient_ids = unique(sce_obj$Model_ID)
+genes_on_Heatmap = top_disp_genes_df$gene
+
+# Create a randomly selected sce woith 300 cells per sample
+set.seed(123)
+sce_obj_downsampled = downsample_sce(sce = sce_obj, group_column = "Clean_ID", n_per_group = 300)
+
+# Make list of sce objects by patient
+#####################################
+
+sce_list = lapply(patient_ids, function(pid){
+  
+  sce_obj = sce_obj_downsampled[genes_on_Heatmap, which(sce_obj_downsampled$Model_ID == pid)]
+  col_order = order(sce_obj$Model_System, sce_obj$Clean_ID)
+  sce_obj_patient = sce_obj[,col_order]
+  return(sce_obj_patient)
+  
+}
+)
+
+names(sce_list) <- patient_ids # Name according patient_id
+
+# Make list of logCounts expression matrix by patient
+#####################################################
+
+expr_list <- lapply(patient_ids, function(pid) {
+  
+  expr_mat = logcounts(sce_list[[pid]])
+  # expr_mat <- expr_mat[genes_on_Heatmap, , drop = FALSE]  # Keeps duplicates
+  
+})
+
+names(expr_list) <- patient_ids # Name according patient_id
+
+
+# Make list of logCounts expression matrix by patient
+###################################################
+
+z_list <- lapply(patient_ids, function(pid){
+  
+  z_expr_mtx = t(scale(t(expr_list[[pid]])))
+  z_expr_mtx[is.na(z_expr_mtx)] <- 0
+  
+  return(z_expr_mtx)
+}
+)
+
+names(z_list) <- patient_ids # Name according patient_id
+
+# Make list of top annotation by patient
+########################################
+
+anno_list <- lapply(patient_ids, function(pid) {
+  
+  HeatmapAnnotation(
+    Clean_ID = factor(sce_list[[pid]]$Short_ID),
+    col = list(Clean_ID = pal.PDOX.PDOXO.updated.short.id),
+    show_annotation_name = FALSE,
+    show_legend = FALSE
+  )
+}
+)
+
+# Make one fixed row annotation
+###############################
+
+row_anno <- rowAnnotation(
+  Pathways = anno_text(
+    top_disp_genes_df$pathways,
+    gp = gpar(fontsize = 6),
+    just = "left"
+  ),
+  width = unit(4.5, "cm")
+)
+
+# Define common color scaled for log-normalized values
+####################################################
+
+# Define the number of colors in your color vector
+num_colors <- length(pal_zscore)
+
+# Calculate breakpoints and ensure the white color is at the midpoint (0)
+mid_index <- ceiling(num_colors / 2)  # Index of the white color
+
+# Get global min and max from z-score matrices
+z_min <- min(unlist(lapply(z_list, min)), na.rm = TRUE)
+z_max <- max(unlist(lapply(z_list, max)), na.rm = TRUE)
+
+breakpoints <- c(
+  seq(-5, 0, length.out = mid_index),
+  seq(0, 5, length.out = num_colors - mid_index + 1)[-1]  # Avoid duplicating 0
+)
+
+color_function <- colorRamp2::colorRamp2(breakpoints, pal_zscore)
+
+# Row font size
+row_fontsize <- case_when(
+  length(genes_on_Heatmap) >= 150 ~ 4,
+  length(genes_on_Heatmap) >= 100 ~ 5,
+  length(genes_on_Heatmap) >= 50 ~ 6,
+  TRUE ~ 7
+)
+
+# Map function to make heatnap on the diffrent list of objets
+
+heatmap_list <- Map( function(sce, mtx, pid, anno) {
+  
+  Heatmap(
+    matrix = mtx,
+    name = "z_score",
+    col = color_function,
+    column_title_gp = gpar(fontsize = row_fontsize + 4, fontface = "bold"),
+    cluster_rows = F,
+    cluster_columns = F,
+    show_column_dend = FALSE,
+    show_row_dend = FALSE,
+    show_row_names = TRUE,
+    show_column_names = FALSE,
+    column_split = factor(sce$Model_System,levels = c("Xenograft","Xenograft_Organoids")),
+    cluster_column_slices = F,
+    top_annotation = anno,
+    row_split = factor(top_disp_genes_df$term, levels = unique(top_disp_genes_df$term)),
+    row_title_rot = 360,
+    row_title_gp = gpar(fontsize = row_fontsize + 3, fontface = "bold"),
+    use_raster = TRUE,
+    raster_quality = 2,
+    width = unit(6, "inch"),
+    row_names_gp = gpar(fontsize = row_fontsize),
+    heatmap_legend_param = list(
+      title = "log2(norm)",
+      direction = "horizontal",
+      title_position = "topcenter",
+      legend_width = unit(4, "cm")
+    )
+  )
+}, sce_list, z_list, names(expr_list), anno_list)
+
+{
+  
+  # Save the combined plot
+  pdf(
+    file = paste0(out_path, time_stamp(), "Split_by_Patient_Heatmap_SELECTED.pdf"),
+    width = 16, height = 10
+  )
+  
+  draw(
+    heatmap_list[[1]]  + heatmap_list[[2]],
+    heatmap_legend_side = "bottom",
+    annotation_legend_side = "bottom",
+    gap = unit(1, "inch"),
+    padding = unit(c(1, 1, 1, 1), "inch"),
+    merge_legend = TRUE
+  )
+  
+  dev.off()
+  
+}
+
+```
+
+
+
+
+
+

@@ -1,0 +1,508 @@
+---
+title:  "7. PDOX and PDOXO (P20-11 & P20-23): Differential Expression"
+author: "Romuald Parmentier"
+date: "2025-04-02"
+output: html_document
+---
+
+```{r Prepare environment, message = F}
+
+# Libraries
+library(Seurat)
+library(SingleCellExperiment)
+library(scran)
+library(scater)
+library(dplyr)
+library(ggplot2)
+library(stringr)
+library(ggvenn)
+
+# Functions and palettes
+source("/scicore/home/wykopa75/GROUP/rparmentier/sc_RNAseq/Projects/Prostate/Xenograft_Models/Xenograft_Models_Custom_Functions.R")
+source("/scicore/home/wykopa75/GROUP/rparmentier/sc_RNAseq/Projects/Prostate/Xenograft_Models/Xenograft_Models_Color_Palettes.R")
+
+# Create output path
+out_path = create_exp_folder(
+  organ = "Prostate" ,
+  project = "Xenograft_Models",
+  samples_ID = "All_PDOXs_PDOXOs",
+  exp = "7_Differential_Expression"
+)
+
+```
+
+```{r}
+
+# Load combined rescaled sce object after normalization and rescaling
+file_path = get_exp_file_path(
+  organ = "Prostate" ,
+  project = "Xenograft_Models",
+  samples_ID = "All_PDOXs_PDOXOs",
+  prev_exp = "6.0_Dimension_Reduction_No_Regression",
+  pattern = "sce_comb.rds")
+
+sce_comb = readRDS(file_path)
+
+```
+
+```{r convert to Seurat}
+
+# convert to seurat object
+seurat_obj = as.Seurat(
+  x = sce_comb, 
+  counts = "counts", 
+  data = "logcounts"
+)
+
+# scale the seurat object
+seurat_obj = ScaleData(seurat_obj)
+
+# Define the default assay
+DefaultAssay(seurat_obj) = "originalexp"
+
+```
+
+# Performing DE
+
+```{r FindAllMarkers (Supp.file XX): Xenograft vs Organoids - each model separately}
+
+Idents(seurat_obj) = "Model_System"
+
+# Define the models
+models <- unique(seurat_obj$Model_ID)
+
+# List to store markers for each model
+markers_list = list()
+markers_filtered_list = list ()
+
+## ---- Loop on models to perform DE ----
+
+for (model in models) {
+  
+  # Subset the data for the current model
+  seurat_model <- subset(seurat_obj, subset = Model_ID == model)
+  
+  # Perform FindAllMarkers for the current model
+  markers <- FindAllMarkers(
+    object = seurat_model,
+    assay = "originalexp",
+    slot = "data",
+    min.pct = 0.50,
+    logfc.threshold = 0.5, # Set a lower threshold initially
+    only.pos = TRUE,
+    test.use = "MAST"
+  )
+  
+  # Filter for markers with logFC > 1.5
+  markers_filtered <- markers %>% filter(avg_log2FC > 1.5)
+  
+  # Store the filtered markers
+  markers_filtered_list[[model]] <- markers_filtered
+  markers_list[[model]] <- markers
+  
+}
+
+## ---- Export rds object (list of DE table each model) ----
+
+saveRDS(
+  object = markers_list,
+  file = paste0(out_path,time_stamp(),"Seurat_DiffExp_Object_Marker_List_Model_System_Model_MAST.rds")
+)
+
+## ---- Export csv table for each model ----
+
+write.csv(
+  x = markers_list[['P20-11']],
+  file = paste0(out_path,time_stamp(),"Differential_Expression_Table_P20-11.csv")
+)
+
+write.csv(
+  x = markers_list[['P20-23']],
+  file = paste0(out_path,time_stamp(),"Differential_Expression_Table_P20-23.csv")
+)
+
+
+```
+
+```{r FindAllMarkers (Supp.Dataset 2): Xenograft vs Organoids - Model merged}
+
+Idents(seurat_obj) = "Model_System"
+
+## ---- Loop on models to perform DE ---
+
+markers <- FindMarkers(
+  object = seurat_obj,
+  ident.1 = "Xenograft_Organoids", # Test
+  ident.2 = "Xenograft", # Ctrl
+  assay = "originalexp",
+  slot = "data",
+  min.pct = 0.75,
+  logfc.threshold = 1, # Set a lower threshold initially
+  only.pos = F,
+  test.use = "MAST"
+)
+
+
+## ---- Export rds and csv object table of globally DE genes  ----
+
+saveRDS(
+  object = markers,
+  file = paste0(out_path,time_stamp(),"Seurat_DiffExp_Object_Marker_List_Model_Merged.rds")
+)
+
+write.csv(
+  x = markers,
+  file = paste0(out_path,time_stamp(),"Differential_Expression_Table_Model_Merged.csv")
+)
+
+```
+
+
+```{r Re-load list of DE file (Xenograft vs Organoids) if needed}
+
+# This avoid performing the DE again if working on visualization is needed
+
+# Load DE file 
+##############
+
+file_path = get_exp_file_path(
+  organ = "Prostate",
+  project = "Xenograft_Models",
+  samples_ID = "All_PDOXs_PDOXOs",
+  prev_exp = "7_Differential_Expression",
+  pattern = "DiffExp_Object_Marker_List_Model_System_Model_MAST.rds")
+
+markers_list <- readRDS(file_path)
+
+```
+
+```{r Extracting common and separate Tumor Up and Organoid Up genes}
+
+# Xenograft  Up 
+###############
+
+Xenograft_up_genes = lapply(X = markers_list, function(x){
+  x = x %>% filter(
+    cluster == "Xenograft",
+    avg_log2FC > 1.5)
+  return(x)
+})
+
+lapply(Xenograft_up_genes, nrow)
+
+# Find common genes between the two models
+common_Xenograft_up_genes <- Reduce(intersect, lapply(Xenograft_up_genes, function(x) x$gene))
+P20.11_Xenograft_up_genes = Xenograft_up_genes[["P20-11"]]
+P20.23_Xenograft_up_genes = Xenograft_up_genes[["P20-23"]]
+
+# Organoids Up 
+#############
+
+organoids_up_genes = lapply(X = markers_list, function(x){
+  x = x %>% filter(
+    cluster == "Xenograft_Organoids",
+    avg_log2FC > 1.5)
+  return(x)
+})
+
+lapply(organoids_up_genes, nrow)
+
+# Find common genes between the two models
+common_organoids_up_genes <- Reduce(intersect, lapply(organoids_up_genes, function(x) x$gene))
+
+# Make separated list for each model
+P20.11_organoids_up_genes = organoids_up_genes[["P20-11"]]
+P20.23_organoids_up_genes = organoids_up_genes[["P20-23"]]
+
+```
+
+# Visualization 
+
+```{r Metadata column in a dataframe}
+
+# get metadata
+md <- as_tibble(colData(sce_comb))
+
+# get embeddings from 2 first PC
+coords <- as_tibble(reducedDim(sce_comb, "UMAP_on_PCA.1-20_No_BatchCorrection"))[,1:2]
+colnames(coords) = c("UMAP_1","UMAP_2")
+
+# combine dataframes
+md <- cbind(md, coords)
+
+```
+
+```{r Venn Diagrams: Tumor vs Organoids comon/specific genes}
+
+# Extract gene symbols
+venn_data <- list(
+  `P20-11 Xenograft up-genes` = P20.11_Xenograft_up_genes$gene,
+  `P20-23 Xenograft up-genes` = P20.23_Xenograft_up_genes$gene
+)
+
+
+ggvenn(
+  venn_data,
+  fill_color = c("#510051", "#510051"),
+  stroke_size = 0.5,
+  set_name_size = 4,
+  text_size = 8
+)
+
+venn_data <- list(
+  `P20-11 Organoids up-genes` = P20.11_organoids_up_genes$gene,
+  `P20-23 Organoids up-genes` = P20.23_organoids_up_genes$gene
+)
+
+ggvenn(
+  venn_data,
+  fill_color = c("#FFBCFF", "#FFBCFF"),
+  stroke_size = 0.5,
+  set_name_size = 4,
+  text_size = 8
+)
+
+
+```
+
+```{r Violin plots: comon Tumor Up Genes}
+
+common_tumor_up_genes = intersect(P20.11_Xenograft_up_genes$gene, P20.23_Xenograft_up_genes$gene)
+
+# Function to generate violin plots for a given gen
+plot_id = 1 
+plot_list = list()
+
+for(gene in common_tumor_up_genes){
+  
+  md$Gene = as.numeric(logcounts(sce_comb[gene,]))
+  
+  plot <- ggplot(data = md, aes(x = Model_ID, y = Gene, fill = Model_System)) +
+    geom_violin(alpha = 0.8, position = position_dodge(width = 0.8), scale = "width") +
+    # geom_quasirandom(size = 0.3, color = "black", alpha = 0.5) + # Allows to fill Violin plot with dots in a qusi random way
+    geom_boxplot(width = 0.1, position = position_dodge(width = 0.8), alpha = 0.5) +    labs(title = gene, y = "Expression") +
+    scale_fill_manual(values = c("Xenograft_Organoids" = "#ADD8E6", "Xenograft" = "#FFD1DC")) +
+    theme_minimal() +
+    theme(
+      legend.position = "top",                       # Position legend on top
+      legend.direction = "horizontal",               # Align legend items horizontally
+      legend.title = element_blank(),         # Adjust legend title size
+      legend.text = element_text(size = 8),          # Adjust legend text size
+      legend.key.size = unit(0.5, "cm"),
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      axis.title.x = element_blank()) + 
+    ylim(c(0,10))
+  
+  plot_list[[plot_id]] = plot
+  
+  plot_id = plot_id + 1
+  
+}  
+
+multiple_page_layout <- gridExtra::marrangeGrob(
+  grobs = plot_list, 
+  nrow = 3, ncol = 3)
+
+# Save the plots into a PDF file
+ggsave(
+  filename = paste0(out_path,time_stamp(),"Violin_Plots_Common_Tumor_Up_Genes.pdf"),
+  plot = multiple_page_layout,
+  device = "pdf",
+  units = "mm",
+  width = 210,
+  height = 297
+)
+
+```
+
+```{r Violin plots: common Organoids Up Genes}
+
+common_organoids_up_genes = intersect(P20.11_organoids_up_genes$gene,P20.23_organoids_up_genes$gene)
+
+# Function to generate violin plots for a given gen
+
+plot_id = 1 
+plot_list = list()
+
+for(gene in common_organoids_up_genes){
+  
+  md$Gene = as.numeric(logcounts(sce_comb[gene,]))
+  
+  plot <- ggplot(data = md, aes(x = Model_ID, y = Gene, fill = Model_System)) +
+    geom_violin(alpha = 0.8, position = position_dodge(width = 0.8), scale = "width") +
+    # geom_quasirandom(size = 0.3, color = "black", alpha = 0.5) + # Allows to fill Violin plot with dots in a qusi random way
+    geom_boxplot(width = 0.1, position = position_dodge(width = 0.8), alpha = 0.5) +    labs(title = gene, y = "Expression") +
+    scale_fill_manual(values = c("Xenograft_Organoids" = "#ADD8E6", "Xenograft" = "#FFD1DC")) +
+    theme_minimal() +
+    theme(
+      legend.position = "top",                       # Position legend on top
+      legend.direction = "horizontal",               # Align legend items horizontally
+      legend.title = element_blank(),         # Adjust legend title size
+      legend.text = element_text(size = 8),          # Adjust legend text size
+      legend.key.size = unit(0.5, "cm"),
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      axis.title.x = element_blank()) + 
+    ylim(c(0,10))
+  
+  plot_list[[plot_id]] = plot
+  
+  plot_id = plot_id + 1
+  
+}  
+
+multiple_page_layout <- gridExtra::marrangeGrob(
+  grobs = plot_list, 
+  nrow = 3, ncol = 3)
+
+# Save the plots into a PDF file
+ggsave(
+  filename = paste0(out_path,time_stamp(),"Violin_Plots_Common_Organoids_Up_Genes.pdf"),
+  plot = multiple_page_layout,
+  device = "pdf",
+  units = "mm",
+  width = 210,
+  height = 297
+)
+
+```
+
+# DE for GSEA 
+
+Instead of setting a treshold in FC between Model_System here, all FC are computed (even negative ones)
+=> This is because GSEA needs them all to perform
+
+```{r Performing DEA without FC threshold}
+
+Idents(seurat_obj) = "Model_System"
+
+# Define the models
+models <- unique(seurat_obj$Model_ID)
+
+# List to store markers for each model
+markers_list = list()
+markers_filtered_list = list ()
+
+# Loop through each model and perform DEA
+for (model in models) {
+  
+  # Subset the data for the current model
+  seurat_model <- subset(seurat_obj, subset = Model_ID == model)
+  
+  # Perform FindAllMarkers for the current model
+  markers <- FindMarkers(
+    object = seurat_model,
+    ident.1 = "Xenograft",
+    ident.2 = "Xenograft_Organoids",
+    assay = "originalexp",
+    slot = "data",
+    min.pct = 0.50,
+    logfc.threshold = 0, 
+    only.pos = F, # Up and Down genes will be given
+    test.use = "MAST"
+  )
+  
+  # Filter for markers with logFC > 1.5
+  markers_filtered <- markers %>% filter(avg_log2FC > 1.5)
+  
+  # Store the filtered markers
+  markers_filtered_list[[model]] <- markers_filtered
+  markers_list[[model]] <- markers
+  
+}
+
+saveRDS(
+  object = markers_list,
+  file = paste0(out_path,time_stamp(),"Seurat_DiffExp_Object_Marker_List_Model_System_Model_MAST_GSEA.rds")
+)
+
+```
+
+```{r Re-load DE GSEA file}
+
+# This avoid perforing the DE again if working on visualization is needed
+
+# Load DE file 
+##############
+
+file_path = get_exp_file_path(
+  organ = "Prostate",
+  project = "Xenograft_Models",
+  samples_ID = "All_PDOXs_PDOXOs",
+  prev_exp = "7_Differential_Expression",
+  pattern = "DiffExp_Object_Marker_List_Model_System_Model_MAST_GSEA.rds")
+
+markers_list <- readRDS(file_path)
+
+```
+
+#  Visualization
+
+```{r MA plot per (logFC vs Mean Expression)}
+
+plot_list = list()
+plot_id = 1
+
+for (model in names(markers_list)) {
+  
+  genes_FC = markers_list[[model]]
+  genes_FC$SYMBOL = rownames(genes_FC)
+  
+  sce_model = sce_comb[, which(sce_comb$Model_ID == model)]
+  sce_model = sce_model[which(rownames(sce_model) %in%  genes_FC$SYMBOL),]
+  
+  genes_FC$log10_p_val = -log10(genes_FC$p_val_adj)
+  genes_FC$significant = ifelse(genes_FC$p_val_adj < 0.001, yes = "yes", no = "no")
+  genes_FC$high_FC = ifelse(
+    test = abs(genes_FC$avg_log2FC) > 1.5 & genes_FC$significant == "yes" , 
+    yes = "yes", no = "no")
+  
+  
+  genes_FC$avg_expression = apply(
+    X = as.matrix(logcounts(sce_model)), 
+    MARGIN = 1, 
+    FUN = mean)
+  
+  # Label points with high absolute log2FC
+  genes_FC$label_gene <- ifelse(abs(genes_FC$avg_log2FC) > 3, genes_FC$SYMBOL, NA)
+  
+  plot_list[[plot_id]] = ggplot(data = genes_FC, aes(x = avg_expression, y = avg_log2FC)) + 
+    geom_point(aes(fill = high_FC), alpha = 0.8, size = 2, shape = 21) +
+    scale_fill_manual(values = c("yes" = "#FCA08D", "no" = "lightgrey")) + 
+    geom_text_repel(aes(label = label_gene), size = 2.5, max.overlaps = 20, box.padding = 0.3) +
+    theme_classic() + 
+    labs(title = paste0(model,": Xenograft vs Organoids")) +
+    guides(
+      alpha = "none",
+      size = "none"
+    ) +
+    xlim(c(0, 8)) +
+    ylim(c(-11,11)) +
+    # Add transparent colored rectangles
+    annotate("rect", xmin = -Inf, xmax = Inf, ymin = 0, ymax = 11, 
+             fill = "#FFD1DC", alpha = 0.2) +  # pinkish
+    annotate("rect", xmin = -Inf, xmax = Inf, ymin = -11, ymax = 0, 
+             fill = "#ADD8E6", alpha = 0.2) +  # blueish
+    # Add labels inside the rectangles
+    annotate("text", x = 6.5, y = 9.5, label = "Up in Xenograft", size = 3.5, fontface = "bold", color = "#C2185B") +
+    annotate("text", x = 6.5, y = -9.5, label = "Up in Organoids", size = 3.5, fontface = "bold", color = "#1565C0")
+  
+  plot_id = plot_id + 1
+  
+}
+
+# Create a multi-page layout for the plots
+multiple_page_layout <- gridExtra::marrangeGrob(
+  grobs = plot_list, 
+  nrow = 2, ncol = 1
+)
+
+ggsave(
+  plot = multiple_page_layout,
+  filename = paste0(out_path, time_stamp(),"MA_plot_","DE_genes.pdf"),
+  device = "pdf",
+  width = 6,
+  height = 10
+)
+
+```
+

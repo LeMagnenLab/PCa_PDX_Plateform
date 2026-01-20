@@ -1,0 +1,172 @@
+---
+title: "P20-11 ADT treated (3 Days) : normalization"
+author: "Romuald Parmentier"
+date: "2025-06-06"
+output: html_document
+---
+
+```{r Prepare environment, message = F}
+
+# Libraries
+library(Seurat)
+library(SingleCellExperiment)
+library(scran)
+library(stringr)
+library(dplyr)
+library(tibble)
+library(ggplot2)
+
+# Functions and palettes
+
+# Functions and palettes
+source("/scicore/home/wykopa75/GROUP/rparmentier/sc_RNAseq/Projects/Prostate/Xenograft_Models/Xenograft_Models_Custom_Functions.R")
+source("/scicore/home/wykopa75/GROUP/rparmentier/sc_RNAseq/Projects/Prostate/Xenograft_Models/Xenograft_Models_Color_Palettes.R")
+
+# Create output path (adapted)
+
+out_path = create_exp_folder(
+  organ = "Prostate",
+  project = "Xenograft_Models",
+  samples_ID = "P20-11_3d_ADT",
+  exp = "4_Normalization"
+)
+
+```
+
+```{r Load list of sce_obj after QC}
+
+# Load sce_obj object after quality control (adapted)
+file_path = get_exp_file_path(
+  organ = "Prostate",
+  project = "Xenograft_Models",
+  samples_ID = "Comon_Steps",
+  prev_exp = "3_QC_HTO_and_Non_HTO_Samples", 
+  pattern = "list_sce_flag_qc.rds")
+
+list_sce_obj = readRDS(file = file_path) 
+sample_names = names(list_sce_obj)
+
+```
+
+# Prepare the data
+
+```{r Filter PDO samples }
+
+# Select only P20-11 ADT 3days
+sce_obj = list_sce_obj$rm04
+
+# Remove the Enza treatment condition
+sce_obj_with_discarded_cells = sce_obj[,which(sce_obj$Multiplexing_Condition %in% c("DHT_noENZA","noDHT_noENZA"))]
+
+# Remove cells flagged asbad quality cells
+sce_obj = sce_obj_with_discarded_cells[, which(sce_obj_with_discarded_cells$qc_discarded == F)]
+
+```
+
+# Extra QC er condition check-up
+
+```{r}
+
+md_df = as_tibble(colData(sce_obj_with_discarded_cells)) %>%
+  filter(Multiplexing_Condition != "Undefined")
+
+# Pct of discarded cells per condition
+######################################
+
+qc_df <- md_df %>%
+  group_by(Multiplexing_Condition) %>%
+  summarise(prop_qc_discarded = round(100 * sum(qc_discarded) / n(), 10))
+
+plot_1 = ggplot(qc_df, aes(x = Multiplexing_Condition, y = prop_qc_discarded, fill = Multiplexing_Condition )) +
+  geom_bar(stat = "identity") +
+  labs(
+    y = "Discarded cells (%)",
+    x = "Condition",
+    title = "Percentage of QC-discarded cells per condition"
+  ) +
+  ylim(c(0,50)) +
+  scale_fill_manual(values = pal.treatment) +
+  theme_minimal() + 
+  theme(title = element_text(size = 6),
+        legend.position = "none")
+# Pct of discarded cells (over total nb of cells correctly HTO assigned) with high % mito reads
+###############################################################################################
+
+qc_df = md_df %>%
+  group_by(Multiplexing_Condition) %>%
+  summarise(prop_mito_discarded = round(sum(mito_discarded)/n(),2)*100) 
+
+plot_2 = ggplot(qc_df, aes(x = Multiplexing_Condition, y = prop_mito_discarded, fill = Multiplexing_Condition )) +
+  geom_bar(stat = "identity") +
+  labs(
+    y = "Discarded cells (%)",
+    x = "Condition",
+    title = "Percentage of high mitochondrial reads cells over all correctly assigned cells"
+  ) +  
+  ylim(c(0,50)) +
+  scale_fill_manual(values = pal.treatment) +
+  theme_minimal() + 
+  theme(title = element_text(size = 6),
+        legend.position = "none")
+
+
+# Pct of discarded cells (over total nb of cells correctly HTO assigned) with low nb of genes
+###############################################################################################
+qc_df = md_df %>%
+  group_by(Multiplexing_Condition) %>%
+  summarise(prop_gene_discarded = round(sum(gene_discarded)/n(),2)*100) 
+
+plot_3 = ggplot(qc_df, aes(x = Multiplexing_Condition, y = prop_gene_discarded, fill = Multiplexing_Condition )) +
+  geom_bar(stat = "identity") +
+  labs(
+    y = "Discarded cells (%)",
+    x = "Condition",
+    title = "Percentage of high mitochondrial reads cells over all correctly assigned cells"
+  ) +
+    ylim(c(0,50)) +
+  scale_fill_manual(values = pal.treatment) +
+  theme_minimal() + 
+  theme(title = element_text(size = 6),
+        legend.position = "none")
+
+
+plots = marrangeGrob(
+  grobs = list(plot_1, plot_2, plot_3),
+  ncol = 3,
+  nrow = 1
+)
+
+
+ggsave(plot = plots,
+  filename = paste0(out_path, time_stamp(), "pct_discarded_per_treatment.pdf"),
+  width = 12, height = 4,
+  device = "pdf")
+
+```
+
+# Normalization
+
+```{r Cluster based normalization}
+
+set.seed(100)
+min.size = 200  
+
+# Identify clusters of similar cells to stabilize size factor estimation
+clust.sce_obj = quickCluster(sce_obj, min.size = min.size)
+
+# Compute size factors using deconvolution method within clusters
+sce_obj <- computeSumFactors(sce_obj, clusters = clust.sce_obj)
+
+# Log-normalize counts using the estimated size factors
+sce_obj_normed <- logNormCounts(sce_obj, size.factors = sce_obj$sizeFactor)
+
+```
+
+```{r}
+
+saveRDS(
+  object = sce_obj_normed,
+  file = paste0(out_path,time_stamp(), "sce_obj_normalized.rds"))
+
+```
+

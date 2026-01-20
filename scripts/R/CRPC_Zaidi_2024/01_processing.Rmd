@@ -1,0 +1,679 @@
+---
+title: "Untitled"
+author: "Romuald Parmentier"
+date: "2025-11-07"
+output: html_document
+---
+
+```{r Set up the environment}
+
+#Libraries
+##########
+library(SingleCellExperiment)
+library(scuttle)
+library(dplyr)
+library(scran)
+library(readxl)
+library(Nebulosa)
+library(scCustomize)
+library(purrr)
+library(ggpubr)
+library(gridExtra)
+
+### Source Custom Functions
+source("/scicore/home/wykopa75/GROUP/rparmentier/sc_RNAseq/Projects/Prostate/Xenograft_Models/Xenograft_Models_Custom_Functions.R")
+source("/scicore/home/wykopa75/GROUP/rparmentier/sc_RNAseq/Projects/Prostate/Xenograft_Models/Xenograft_Models_Color_Palettes.R")
+
+### Define Output   Path
+out_path <- create_exp_folder(
+  organ = "Prostate",
+  project = "Xenograft_Models",
+  samples_ID = "CRPC_Zaidi_2024",
+  exp = "1_processing"
+)
+
+```
+
+```{r Loading input and creating output path}
+
+seurat_obj = readRDS("/scicore/home/wykopa75/GROUP/rparmentier/sc_RNAseq/Projects/Sequencing_Data/Pre_Processed_Data/Zaidi_2024/GSE264573_msk.integrated.remove.cellcycle.tumor.cells.rds")
+
+```
+
+```{r Object inspection and filtering}
+
+# Remove samples wth less than 100 cells
+get_rid = names(which(table(seurat_obj$patient) < 100))
+seurat_obj_filtered = seurat_obj[,-which(seurat_obj$patient %in% get_rid)]
+table(seurat_obj_filtered$patient)
+
+# Display basic genes and check structure
+FeaturePlot(object = seurat_obj_filtered,features = c("AR", "KLK3", "SYP", "CHGA"))
+
+# Export the plots
+plot = VlnPlot(object = seurat_obj_filtered, features = c("AR", "KLK3","SYP", "CHGA", "SOX2"), group.by = "patient")
+
+ggsave(plot, 
+       width = 14, height = 6,
+       file = paste0(out_path, time_stamp(), "plots_Vln_AR_SYP_CHGA.pdf"))
+
+```
+
+# Re-analysis of AR_Low & NEPC samples
+
+## Object creation
+
+```{r Subset and re-normalize to AR_Low & NEPC neg patients }
+
+AR_low_NEPC_neg_seurat = subset(
+  seurat_obj_filtered, 
+  subset = patient %in% c("MSK-HP09","MSK-HP10", "MSK-HP17", "MSK-HP19","MSK-HP20", "MSK-HP21")
+  )
+
+list_subset <- SplitObject(AR_low_NEPC_neg_seurat, split.by = "patient")
+
+list_subset <- lapply(list_subset, function(x) {
+  
+  SCTransform(
+    x, 
+    assay = "RNA",# Raw counts
+    vst.flavor = "v1")
+  
+})
+
+```
+
+```{r Merge seurat objects}
+
+dnpc.anchors <- FindIntegrationAnchors(
+  object.list = list_subset, 
+  dims = 1:20)
+
+dnpc.anchors <- IntegrateData(anchorset = dnpc.anchors, dims = 1:20)
+
+DefaultAssay(dnpc.anchors) <- "integrated"
+
+# Run the standard workflow for visualization and clustering
+dnpc.anchors <- ScaleData(dnpc.anchors, verbose = FALSE)
+dnpc.anchors <- RunPCA(dnpc.anchors, npcs = 30, verbose = FALSE)
+
+# t-SNE and Clustering
+dnpc.anchors <- RunUMAP(dnpc.anchors, reduction = "pca", dims = 1:20)
+dnpc.anchors <- FindNeighbors(dnpc.anchors, reduction = "pca", dims = 1:20)
+dnpc.anchors <- FindClusters(dnpc.anchors, resolution = 0.5)
+
+```
+
+```{r Export merged object}
+
+saveRDS(
+  object = dnpc.anchors,
+  file = paste0(out_path, time_stamp(), "seurat_merged_DNPC_patients.rds"))
+
+```
+
+## Visualization
+
+```{r Feature plots canva: colors by log2UMI}
+
+genes_to_plot <- c("AR","PROX1","ALDH1A1", "SOX2","CHGA", "KRT17")
+
+DefaultAssay(dnpc.anchors) <- "RNA"
+
+# ---- Extract UMAP and gene expression into a temporary tibble ----
+umap_df <- as.data.frame(Embeddings(dnpc.anchors, "umap"))
+colnames(umap_df) <- c("UMAP_1","UMAP_2")
+
+# Fetch expression for requested genes (uses slot = "data" by default)
+# This returns a data.frame aligned to cells; missing genes are dropped automatically.
+expr_df <- FetchData(dnpc.anchors, vars = genes_to_plot, slot = "data", assay = assay_use)
+
+# Combine (order is guaranteed to match cells)
+md <- bind_cols(as_tibble(umap_df), as_tibble(expr_df))
+
+# ---- Build one ggplot per present gene ----
+canva <- map(genes_to_plot, function(gene_name){
+  
+  plot = ggplot(md, aes(UMAP_1, UMAP_2)) +
+    geom_point(aes(fill = .data[[gene_name]]),
+               shape = 21, colour = "black", stroke = 0.15, size = 1, alpha = 0.9) +
+    scale_fill_gradientn(colors = pal.log2) +
+    coord_equal() +
+    theme_classic2() +
+    labs(title = gene_name, fill = "expr") +
+    theme(
+      plot.title = element_text(hjust = 0.5, size = 10)
+    )
+  
+  return(plot)
+}
+)
+
+plot_list = marrangeGrob(
+  grobs = canva,
+  ncol = 1,
+  nrow = 3)
+
+ggsave(plot_list, 
+       width = 210, height = 210, units = "mm", 
+       file = paste0(out_path, time_stamp(), "plots_dotplot_DNPC_AR_PROX1_ALDH1A1.pdf"))
+
+
+```
+
+```{r Co-expression plots canva: colored by sample}
+
+genes_to_plot <- c("PROX1","ALDH1A1")
+
+DefaultAssay(dnpc.anchors) <- "RNA"
+
+# Fetch expression for requested genes (uses slot = "data" by default)
+# This returns a data.frame aligned to cells; missing genes are dropped automatically.
+expr_df <- FetchData(dnpc.anchors, vars = genes_to_plot, slot = "data", assay = "RNA")
+
+# Combine (order is guaranteed to match cells)
+md <- cbind(
+  as_tibble(dnpc.anchors@meta.data),
+  as_tibble(expr_df)
+)
+
+# ---- Build one ggplot per present gene ----
+
+plot = ggplot(md, aes(PROX1, ALDH1A1)) +
+  geom_point(aes(fill = patient),
+             shape = 21, colour = "black", stroke = 0.15, size = 1, alpha = 0.9) +
+  theme_classic2() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 10)
+  ) +
+  facet_wrap(~patient)
+
+
+ggsave(plot, 
+       width = 210, height = 210, units = "mm", 
+       file = paste0(out_path, time_stamp(), "plots_dotplot_DNPC_AR_PROX1_ALDH1A1.pdf"))
+
+
+```
+
+```{r Co-expression plots canva: split by sample - LogNormnalized}
+
+genes_to_plot <- c("PROX1","ALDH1A1")
+
+plot_list = imap(list_subset,  function(seurat_obj, sample_name){
+  
+  # Access classic log-normalized values
+  seurat_obj <- NormalizeData(seurat_obj, assay = "RNA", normalization.method = "LogNormalize")
+  DefaultAssay(seurat_obj) = "RNA"
+
+  # Fetch expression for requested genes (uses slot = "data" by default)
+  # This returns a data.frame aligned to cells; missing genes are dropped automatically.
+  expr_df <- FetchData(seurat_obj, vars = genes_to_plot, slot = "data")
+  
+  # Combine (order is guaranteed to match cells)
+  md <- cbind(
+    as_tibble(seurat_obj@meta.data),
+    as_tibble(expr_df)
+  )
+  
+  # ---- Build one ggplot per present gene ----
+  
+  plot = ggplot(md, aes(PROX1, ALDH1A1)) +
+    geom_point(shape = 21, colour = "black", stroke = 0.15, size = 1, alpha = 0.9) +
+    theme(plot.title = element_text(hjust = 0.5, size = 10))
+  
+  plot
+  
+}
+
+)
+
+plot_list = marrangeGrob(
+  grobs = plot_list,
+  ncol = 1,
+  nrow = 3)
+
+ggsave(plot_list, 
+       width = 210, height = 210, units = "mm", 
+       file = paste0(out_path, time_stamp(), "plots_dotplot_DNPC_AR_PROX1_ALDH1A1_split_LogNromed.pdf"
+       )
+)
+
+
+```
+
+```{r Co-expression plots canva: split by sample - SCT transforned}
+
+genes_to_plot <- c("PROX1","ALDH1A1")
+
+plot_list = imap(list_subset,  function(seurat_obj, sample_name){
+  
+  # Access classic log-normalized values
+  # seurat_obj <- SCTransform(seurat_obj, assay = "RNA",vst.flavor = "v1")
+  DefaultAssay(seurat_obj) = "SCT"
+  expr_df <- FetchData(seurat_obj, vars = genes_to_plot, slot = "scale.data")
+  
+  # Combine (order is guaranteed to match cells)
+  md <- cbind(
+    as_tibble(seurat_obj@meta.data),
+    as_tibble(expr_df)
+  )
+  
+  # ---- Build one ggplot per present gene ----
+  
+  plot = ggplot(md, aes(PROX1, ALDH1A1)) +
+    geom_point(shape = 21, colour = "black", stroke = 0.15, size = 1, alpha = 0.9) +
+    theme(plot.title = element_text(hjust = 0.5, size = 10))
+  
+  plot
+  
+}
+
+)
+
+plot_list = marrangeGrob(
+  grobs = plot_list,
+  ncol = 1,
+  nrow = 3)
+
+ggsave(plot_list, 
+       width = 210, height = 210, units = "mm", 
+       file = paste0(out_path, time_stamp(), "plots_dotplot_DNPC_AR_PROX1_ALDH1A1_split_SCTed.pdf"
+       )
+)
+
+
+```
+
+# Re-analysis of AR_Low samples (DNPC and NEPC)
+
+## Object creation
+
+```{r Subset and re-normalize to AR_Low & NEPC neg patients }
+
+AR_low_NEPC_neg_seurat = subset(
+  seurat_obj_filtered, 
+  subset = patient %in% c("MSK-HP09","MSK-HP10", "MSK-HP17", "MSK-HP19","MSK-HP20", "MSK-HP21")
+  )
+
+list_subset <- SplitObject(AR_low_NEPC_neg_seurat, split.by = "patient")
+
+list_subset <- lapply(list_subset, function(x) {
+  
+  SCTransform(
+    x, 
+    assay = "RNA") # Raw counts
+  
+})
+
+```
+
+```{r Merge seurat objects}
+
+# select integration features and prep step
+features <- SelectIntegrationFeatures(list_subset)
+
+list_subset = PrepSCTIntegration(
+  list_subset,
+  assay = "SCT", # default
+  anchor.features = features,
+  verbose = TRUE
+)
+
+# downstream integration steps
+dnpc.nepc.anchors <- FindIntegrationAnchors(
+  object.list = list_subset, 
+  dims = 1:20)
+
+DNPC_NEPC_seurat <- IntegrateData(anchorset = dnpc.nepc.anchors, dims = 1:20)
+
+DefaultAssay(DNPC_NEPC_seurat) <- "integrated"
+
+# Run the standard workflow for visualization and clustering
+DNPC_NEPC_seurat <- ScaleData(DNPC_NEPC_seurat, verbose = FALSE)
+DNPC_NEPC_seurat <- RunPCA(DNPC_NEPC_seurat, npcs = 30, verbose = FALSE)
+
+# t-SNE and Clustering
+DNPC_NEPC_seurat <- RunUMAP(DNPC_NEPC_seurat, reduction = "pca", dims = 1:20)
+DNPC_NEPC_seurat <- FindNeighbors(DNPC_NEPC_seurat, reduction = "pca", dims = 1:20)
+DNPC_NEPC_seurat <- FindClusters(DNPC_NEPC_seurat, resolution = 0.5)
+
+```
+
+```{r Export merged object}
+
+saveRDS(
+  object = DNPC_NEPC_seurat,
+  file = paste0(out_path, time_stamp(), "seurat_merged_NEPC-DNPC_patients_Batch_Corrected.rds"))
+
+```
+
+## Visualization
+
+```{r Reload the merged seurat object}
+
+dnpc.nepc.seurat = get_exp_file_path(
+  organ = "Prostate",
+  project = "Xenograft_Models",
+  samples_ID = "CRPC_Zaidi_2024",
+  prev_exp = "1_processing",
+  pattern = "seurat_merged_NEPC-DNPC_patients.rds"
+)
+
+dnpc.nepc.seurat = readRDS(dnpc.nepc.seurat)
+
+```
+
+```{r UMAP plot: colored by patient ID}
+
+# ---- Extract UMAP and gene expression into a temporary tibble ----
+umap_df <- as.data.frame(Embeddings(dnpc.nepc.seurat, "umap"))
+colnames(umap_df) <- c("UMAP_1","UMAP_2")
+
+# Combine (order is guaranteed to match cells)
+md <- bind_cols(as_tibble(umap_df), as_tibble(dnpc.nepc.seurat@meta.data))
+
+# ---- Build one ggplot per present gene ----
+
+  plot = ggplot(md, aes(UMAP_1, UMAP_2)) +
+      geom_point(
+        data = md,
+        aes(fill = patient),   # fill controlled by gene expression
+        shape = 21,                    # circle with border
+        colour = "gray10",              # visible stroke color
+        stroke = 0.2,                  # border thickness
+        size = 1,
+        alpha = 0.7) +
+      theme_classic() +
+  labs(fill = "Patient ID") +
+  coord_equal()
+
+
+ggsave(plot, 
+       width = 210, height = 105, units = "mm", 
+       file = paste0(out_path, time_stamp(), "plots_DNPC_NEPC_PAtient_ID.pdf"))
+
+```
+
+```{r Feature plots canva: colors by log2UMI - two layer (expr = 0 cells first)}
+
+genes_to_plot <- c("KLK3", "CHGA", "PROX1","ALDH1A1")
+
+DefaultAssay(dnpc.nepc.seurat) <- "RNA"
+
+# ---- Extract UMAP and gene expression into a temporary tibble ----
+umap_df <- as.data.frame(Embeddings(dnpc.nepc.seurat, "umap"))
+colnames(umap_df) <- c("UMAP_1","UMAP_2")
+
+# Fetch expression for requested genes (uses slot = "data" by default)
+# This returns a data.frame aligned to cells; missing genes are dropped automatically.
+expr_df <- FetchData(dnpc.nepc.seurat, vars = genes_to_plot, slot = "data", assay = assay_use)
+
+# Combine (order is guaranteed to match cells)
+md <- bind_cols(as_tibble(umap_df), as_tibble(expr_df))
+
+# ---- Build one ggplot per present gene ----
+canva <- map(genes_to_plot, function(gene_name){
+  
+  plot = ggplot(md, aes(UMAP_1, UMAP_2)) +
+     # First layer of cells with expression z-score arround 0
+    ggrastr::rasterise(
+      geom_point(
+        data = md %>% dplyr::filter(.data[[gene_name]] == 0),
+        aes(fill = .data[[gene_name]]),   # fill controlled by gene expression
+        shape = 21,                    # circle with border
+        colour = "black",              # visible stroke color
+        stroke = 0.2,                  # border thickness
+        size = 1,
+        alpha = 0.4),
+      dpi = 300,
+      scale = 0.7) +
+  geom_point(
+    data = md %>% dplyr::filter(.data[[gene_name]] != 0),
+    aes(fill = .data[[gene_name]]),   # fill controlled by gene expression
+    shape = 21,                    # circle with border
+    colour = "black",              # visible stroke color
+    stroke = 0.2,                  # border thickness
+    size = 0.9,
+    alpha = 1) +
+    scale_fill_gradientn(colors = pal.log2) +
+    coord_equal() +
+    theme_classic2() +
+    labs(title = gene_name, fill = "Log2(UMI)") +
+    theme(
+      plot.title = element_text(hjust = 0.5, size = 10)
+    )
+  
+  return(plot)
+}
+)
+
+plot_list = marrangeGrob(
+  grobs = canva,
+  ncol = 1,
+  nrow = 2)
+
+ggsave(plot_list, 
+       width = 210, height = 210, units = "mm", 
+       file = paste0(out_path, time_stamp(), "plots_dotplot_DNPC_NEPC_KLK3_CHGA_PROX1_ALDH1A1.pdf"))
+
+
+```
+
+```{r Feature plots canva: colors by log2UMI - mixed}
+
+genes_to_plot <- c("KLK3", "CHGA", "PROX1","ALDH1A1")
+
+DefaultAssay(dnpc.nepc.seurat) <- "RNA"
+
+# ---- Extract UMAP and gene expression into a temporary tibble ----
+umap_df <- as.data.frame(Embeddings(dnpc.nepc.seurat, "umap"))
+colnames(umap_df) <- c("UMAP_1","UMAP_2")
+
+# Fetch expression for requested genes (uses slot = "data" by default)
+# This returns a data.frame aligned to cells; missing genes are dropped automatically.
+expr_df <- FetchData(dnpc.nepc.seurat, vars = genes_to_plot, slot = "data", assay = assay_use)
+
+# Combine (order is guaranteed to match cells)
+md <- bind_cols(as_tibble(umap_df), as_tibble(expr_df))
+
+# ---- Build one ggplot per present gene ----
+canva <- map(genes_to_plot, function(gene_name){
+  
+  plot = ggplot(md, aes(UMAP_1, UMAP_2)) +
+     # First layer of cells with expression z-score arround 0
+  geom_point(
+    data = md,
+    aes(fill = .data[[gene_name]]),   # fill controlled by gene expression
+    shape = 21,                    # circle with border
+    colour = "black",              # visible stroke color
+    stroke = 0.2,                  # border thickness
+    size = 0.9,
+    alpha = 1) +
+    scale_fill_gradientn(colors = pal.log2) +
+    coord_equal() +
+    theme_classic2() +
+    labs(title = gene_name, fill = "Log2(UMI)") +
+    theme(
+      plot.title = element_text(hjust = 0.5, size = 10)
+    )
+  
+  return(plot)
+}
+)
+
+plot_list = marrangeGrob(
+  grobs = canva,
+  ncol = 1,
+  nrow = 1)
+
+ggsave(plot_list, 
+       width = 210, height = 210, units = "mm", 
+       file = paste0(out_path, time_stamp(), "plots_test.pdf"))
+
+```
+
+```{r Feature plots: coexpression ALDH1A1-PROX1}
+
+DefaultAssay(dnpc.nepc.seurat) = "RNA"
+
+plot = Plot_Density_Joint_Only(seurat_object = dnpc.nepc.seurat, features = c("PROX1", "ALDH1A1"), custom_palette = pal.log2) +
+  coord_equal()
+
+ggsave(plot, 
+       width = 210, height = 105, units = "mm", 
+       file = paste0(out_path, time_stamp(), "plots_DNPC_NEPC_Coedpression_ALDH1A1_PROX1.pdf"))
+
+```
+
+# DNPC-NEPC Without batch correction
+
+## Object creation
+
+```{r Subset the object and run SCT on it}
+
+AR_low_NEPC_neg_seurat = subset(
+  seurat_obj_filtered, 
+  subset = patient %in% c("MSK-HP09","MSK-HP10", "MSK-HP17", "MSK-HP19","MSK-HP20", "MSK-HP21")
+  )
+
+DefaultAssay(AR_low_NEPC_neg_seurat) <- "RNA"
+
+merged_nepc_dnpc <- SCTransform(
+  AR_low_NEPC_neg_seurat,
+  assay = "RNA",
+  vst.flavor = "v2",               # or "v1" if you prefer
+  conserve.memory = TRUE,
+  verbose = TRUE
+)   
+
+
+
+```
+
+```{r Export non batch corrected merged object}
+
+saveRDS(
+  object = merged_nepc_dnpc,
+  file = paste0(out_path, time_stamp(), "seurat_merged_NEPC-DNPC_patients_Non_Batch_Corrected.rds"))
+
+```
+
+## Visualization
+
+```{r}
+
+merged_nepc_dnpc = get_exp_file_path(
+  organ = "Prostate",
+  project = "Xenograft_Models",
+  samples_ID = "CRPC_Zaidi_2024",
+  prev_exp = "1_processing",
+  pattern = "NEPC-DNPC_patients_Non_Batch_Corrected.rds"
+)
+
+merged_nepc_dnpc = readRDS(merged_nepc_dnpc)
+
+```
+
+```{r UMAP plot: colored by patient ID}
+
+# ---- Extract UMAP and gene expression into a temporary tibble ----
+umap_df <- as.data.frame(Embeddings(merged_nepc_dnpc, "umap"))
+colnames(umap_df) <- c("UMAP_1","UMAP_2")
+
+# Combine (order is guaranteed to match cells)
+md <- bind_cols(as_tibble(umap_df), as_tibble(merged_nepc_dnpc@meta.data))
+
+# ---- Build one ggplot per present gene ----
+
+  plot = ggplot(md, aes(UMAP_1, UMAP_2)) +
+          ggrastr::rasterise(
+            geom_point(
+        data = md,
+        aes(fill = patient),   # fill controlled by gene expression
+        shape = 21,                    # circle with border
+        colour = "gray10",              # visible stroke color
+        stroke = 0.2,                  # border thickness
+        size = 1,
+        alpha = 0.7), dpi = 300, scale = 1) +
+      theme_classic() +
+  guides(fill = guide_legend(override.aes=list(size = 3, alpha = 0.9), title = "New category")) + coord_equal()
+
+
+ggsave(plot, 
+       width = 210, height = 105, units = "mm", 
+       file = paste0(out_path, time_stamp(), "plots_DNPC_NEPC_PAtient_ID_Non_Corrected.pdf"))
+
+```
+
+```{r Feature plots canva: colors by log2UMI - mixed}
+
+genes_to_plot <- c("KLK3", "CHGA", "PROX1","ALDH1A1")
+
+DefaultAssay(merged_nepc_dnpc) <- "RNA"
+
+# ---- Extract UMAP and gene expression into a temporary tibble ----
+umap_df <- as.data.frame(Embeddings(merged_nepc_dnpc, "umap"))
+colnames(umap_df) <- c("UMAP_1","UMAP_2")
+
+# Fetch expression for requested genes (uses slot = "data" by default)
+# This returns a data.frame aligned to cells; missing genes are dropped automatically.
+expr_df <- FetchData(merged_nepc_dnpc, vars = genes_to_plot, slot = "data", assay = assay_use)
+
+# Combine (order is guaranteed to match cells)
+md <- bind_cols(as_tibble(umap_df), as_tibble(expr_df))
+
+# ---- Build one ggplot per present gene ----
+canva <- map(genes_to_plot, function(gene_name){
+
+  ggplot(md, aes(UMAP_1, UMAP_2)) +
+              ggrastr::rasterise(
+    geom_point(
+      aes(
+        fill = .data[[gene_name]],
+        alpha = .data[[gene_name]] > 0   # control alpha based on expression
+      ),
+      shape = 21,
+      colour = "black",
+      stroke = 0.2,
+      size = 1
+    ), scale = 1, dpi = 300) +
+    scale_fill_gradientn(colors = pal.log2) +
+    scale_alpha_manual(
+      values = c("FALSE" = 0.15, "TRUE" = 1),   # zeros faint, positives solid
+      guide = "none"                            # hide alpha legend
+    ) +
+    coord_equal() +
+    theme_classic2() +
+    labs(
+      title = gene_name,
+      fill = "Log2(UMI)"
+    ) +
+    theme(
+      plot.title = element_text(hjust = 0.5, size = 10)
+    )
+})
+
+plot_list = marrangeGrob(
+  grobs = canva,
+  ncol = 1,
+  nrow = 1)
+
+ggsave(plot_list, 
+       width = 4, height = 4,
+       file = paste0(out_path, time_stamp(), "plots_DNPC_NEPC_KLK3_CHGA_PROX1_ALDH1A1_Mixed_Non_Corrected.pdf"))
+
+```
+
+```{r Feature plots: coexpression ALDH1A1-PROX1}
+
+DefaultAssay(merged_nepc_dnpc) = "RNA"
+
+plot = Plot_Density_Joint_Only(seurat_object = merged_nepc_dnpc, features = c("PROX1", "ALDH1A1"), custom_palette = pal.log2) +
+  coord_equal()
+
+ggsave(plot, 
+       width = 210, height = 105, units = "mm", 
+       file = paste0(out_path, time_stamp(), "plots_DNPC_NEPC_Coedpression_ALDH1A1_PROX1_Non_Corrected.pdf"))
+
+```

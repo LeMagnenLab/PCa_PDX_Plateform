@@ -1,0 +1,233 @@
+---
+title: "4. PDOX and PDOXO (P20-11 & P20-23) : normalization and rescaling"
+author: "Romuald Parmentier"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r Prepare environment, message = F}
+
+# Libraries
+library(Seurat)
+library(SingleCellExperiment)
+library(scran)
+library(stringr)
+library(dplyr)
+library(tibble)
+library(ggplot2)
+
+# Functions and palettes
+source("/scicore/home/wykopa75/GROUP/rparmentier/sc_RNAseq/Projects/Prostate/Xenograft_Models/Xenograft_Models_Custom_Functions.R")
+source("/scicore/home/wykopa75/GROUP/rparmentier/sc_RNAseq/Projects/Prostate/Xenograft_Models/Xenograft_Models_Color_Palettes.R")
+
+# Create output path (adapted)
+out_path = create_exp_folder(
+  organ = "Prostate",
+  project = "Xenograft_Models",
+  samples_ID = "All_PDOXs_PDOXOs",
+  exp = "4_Normalization_Rescaling"
+)
+
+```
+
+```{r}
+
+# Load sce object after quality control (adapted)
+file_path = get_exp_file_path(
+  organ = "Prostate",
+  project = "Xenograft_Models",
+  prev_exp = "Comon_Steps/3_QC_HTO_and_Non_HTO_Samples", 
+  pattern = "list_sce_flag_qc.rds")
+
+list_sce = readRDS(file = file_path) 
+
+sample_names = names(list_sce)
+
+```
+
+# Prepare the data
+
+```{r Filter PDO samples }
+
+# Exclude rm04 and rm02 entirely
+list_sce = list_sce[!names(list_sce) %in% c("rm04", "rm06")]
+
+# Apply cell-level filters on specific samples
+list_sce = lapply(names(list_sce), function(sce_name) {
+  
+  sce = list_sce[[sce_name]]
+  
+  if (sce_name == "rm02") {
+    sce = sce[, sce$Multiplexing_Condition == "DHT"]
+  } else if (sce_name == "rp02") {
+    sce = sce[, sce$Multiplexing_Condition == "CTRL_Medium"]
+  } else if (sce_name == "rp27") {
+    sce = sce[, sce$Multiplexing_Condition == "CTRL"]
+  }
+  
+  return(sce)
+  
+  
+})
+
+# Re-assign names to the list_sce object (lost in the previous step)
+sample_names_short = sample_names[!(sample_names %in% c("rm04", "rm06"))]
+names(list_sce) = sample_names_short
+
+```
+
+```{r}
+
+list_sce = lapply(list_sce, function(sce){
+  
+  cells_to_keep = which(sce$qc_discarded == F)
+  sce = sce[,cells_to_keep]
+  return(sce)
+  
+})
+
+list_sce = lapply(list_sce, function(sce){
+  
+  # Add a clean_ID
+  ###############
+  sce$Clean_ID = paste0(sce$Model_ID,"_",sce$Model_Mouse, "_", sce$Model_Passage, "_", sce$Model_System)
+  
+  # Add a short ID
+  ################
+  
+  # Remove the "P" prefix from passage number
+  passage_num = gsub("^P", "", sce$Model_Passage)
+  mouse_id = gsub("Mouse_", "", sce$Model_Mouse)
+  
+  # Abbreviate system
+  system_abbrev <- ifelse(grepl("Xenograft", sce$Model_System), "PDX", "")
+  system_abbrev <- ifelse(grepl("Organoids", sce$Model_System), "Org", system_abbrev)
+  
+  # Combine into short ID: e.g., AP3_PDX
+  sce$Short_ID <- paste0(sce$Model_ID, "_",
+                         gsub("Mouse_", "", sce$Model_Mouse), 
+                         sce$Model_Passage, "_", system_abbrev)
+  
+  return(sce)
+  
+})
+
+
+```
+
+# Nornalization
+
+```{r}
+
+sce_id = 1
+
+for (sce in list_sce) {
+  
+  set.seed(100)
+  min.size = 200  
+  
+  print(paste("Pre-clustering for", names(list_sce)[sce_id], "ongoing..."))
+  clust.sce = quickCluster(sce, min.size = min.size)
+  
+  print(paste("Calculating size factors for", names(list_sce)[sce_id], "ongoing..."))
+  new_sce <- computeSumFactors(sce, clusters = clust.sce)
+  
+  print(paste("Log normalization for", names(list_sce)[sce_id], "ongoing..."))
+  new_sce <- logNormCounts(new_sce, size.factors = new_sce$sizeFactor) 
+  
+  list_sce[[sce_id]] = new_sce
+  sce_id = sce_id + 1
+  
+}
+
+```
+
+```{r}
+
+list_sce_rescaled <- batchelor::multiBatchNorm(
+  min.mean = 0.1, 
+  unlist(list_sce)
+)
+
+```
+
+```{r}
+
+scale_factors_df = tibble()
+
+for(sce_id in 1:length(list_sce)){
+  
+  scale_factors_df_sample = tibble(
+    cell_ID = colnames(list_sce[[sce_id]]),
+    library = unique(list_sce[[sce_id]]$SampleName),
+    factors_before_scaling = list_sce[[sce_id]]$sizeFactor,
+    factors_after_scaling = list_sce_rescaled[[sce_id]]$sizeFactor)
+  
+  scale_factors_df = bind_rows(scale_factors_df, scale_factors_df_sample)
+}
+
+scale_factors_df_long = tidyr::pivot_longer(
+  data = scale_factors_df,
+  cols = c("factors_before_scaling","factors_after_scaling"),
+  names_to = "factors_origin" ) 
+
+scale_factors_df_long$factors_origin = factor(scale_factors_df_long$factors_origin, levels = c("factors_before_scaling","factors_after_scaling"))
+
+plot = ggplot(scale_factors_df_long, aes(x = value)) +
+  geom_density(aes(fill = library), alpha = 0.5) +
+  xlim(c(0,10)) +
+  facet_wrap(~factors_origin)
+
+plot
+
+```
+
+```{r Reconstrcut a single conbined sce}
+
+# Combine all SCE objects in the list into a single SCE
+sce_obj <- do.call(cbind, list_sce)
+
+counts_comb = lapply(list_sce_rescaled, function(x) {counts(x)})
+counts_comb <- Reduce(function(x, y) cbind(x, y), counts_comb)
+
+logcounts_comb = lapply(list_sce_rescaled, function(x) {logcounts(x)})
+logcounts_comb <- Reduce(function(x, y) cbind(x, y), logcounts_comb)
+
+colData_comb = lapply(list_sce_rescaled, function(x) {colData(x)})
+colData_comb = Reduce(function(x, y) rbind(x, y), colData_comb)
+
+sce_obj_rescaled <- SingleCellExperiment( 
+  assays = list(counts = counts_comb, logcounts = logcounts_comb),  
+  rowData = rowData(list_sce_rescaled[[1]]),
+  colData = colData_comb)
+
+```
+
+```{r Reorder factor levels}
+
+
+sce_obj_rescaled$Short_ID = factor(
+  x = sce_obj_rescaled$Short_ID,
+  levels =  c("P20-11_BP1_PDX", "P20-11_BP1_Org","P20-11_BP3_Org", "P20-11_AP3_Org",
+              "P20-23_AP1_PDX","P20-23_AP3_PDX", "P20-23_AP1_Org",  "P20-23_AP3_Org", "P20-23_AP9_Org")
+)
+
+```
+
+
+```{r}
+
+saveRDS(
+  object = list_sce,
+  file = paste0(out_path,time_stamp(), "list_sce_normalized.rds"))
+
+saveRDS(
+  object = list_sce_rescaled,
+  file = paste0(out_path,time_stamp(), "list_sce_normalized_rescaled.rds"))
+
+saveRDS(
+  object = sce_obj_rescaled,
+  file = paste0(out_path,time_stamp(), "sce_obj_normalized_rescaled.rds"))
+
+```
+

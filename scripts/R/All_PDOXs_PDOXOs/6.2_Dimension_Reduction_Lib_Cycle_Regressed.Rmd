@@ -1,0 +1,444 @@
+---
+title: "6_Library_Cycle_Regressed"
+author: "Romuald Parmentier"
+date: "2025-04-01"
+output: html_document
+---
+
+
+```{r Prepare environment, message = F}
+
+# Libraries
+library(SingleCellExperiment)
+library(dplyr)
+library(scran)
+library(scater)
+library(dplyr)
+
+# Functions and palettes
+source("/scicore/home/wykopa75/GROUP/rparmentier/sc_RNAseq/my_R_functions/Xenograft_Models_Custom_Functions.R")
+
+# Create output path (adapted)
+out_path = create_exp_folder(
+  organ = "Prostate",
+  project = "Xenograft_Models",
+  samples_ID = "All_PDOXs_PDOXOs",
+  exp = "6.2_Dimension_Reduction_Lib_Cycle_Regressed"
+)
+
+```
+
+# Prepare the data
+
+```{r Load the files}
+
+# Load combined rescaled sce object after normalization and rescaling
+file_path = get_exp_file_path(
+  organ = "Prostate",
+  project = "Xenograft_Models",
+  prev_exp = "All_PDOXs_PDOXOs/5_Cycle_Annotation", 
+  pattern = "list_sce_cycle_annotated.rds")
+
+list_sce_cycle = readRDS(file_path)
+
+# Load combined rescaled sce object after normalization and rescaling
+file_path = get_exp_file_path(
+  organ = "Prostate",
+  project = "Xenograft_Models",
+  prev_exp = "All_PDOXs_PDOXOs/4_Normalization_Rescaling", 
+  pattern = "list_sce_normalized_rescaled.rds")
+
+list_sce = readRDS(file_path)
+
+```
+
+```{r Propagate the cell_cycle meta column to the list_sce_normalized_rescaled object}
+
+# Propagate a specific metacolumn, e.g., "cell_cycle_phase"
+metacol = "cell_cycle_phase"  # Change to your desired metacolumn name
+
+# Check sample names match
+stopifnot(all(names(list_sce) == names(list_sce_cycle)))
+
+# Propagate the column
+for (sample in names(list_sce)) {
+  
+  sce_target <- list_sce[[sample]]
+  sce_source <- list_sce_cycle[[sample]]
+  
+  # Match cells (assuming same order, otherwise use match)
+  stopifnot(identical(colnames(sce_target), colnames(sce_source)))
+  
+  # Add the metacolumn
+  colData(sce_target)[[metacol]] <- colData(sce_source)[[metacol]]
+  list_sce[[sample]] <- sce_target
+  
+}
+
+```
+
+# Select variable genes
+
+```{r variance modeling for the entire batch}
+
+list_var_model = list()
+sce_id = 1
+
+for(sce in list_sce){
+  
+  var_model = modelGeneVar(sce)
+  
+  list_var_model[[sce_id]] = var_model
+  
+  sce_id = sce_id + 1
+}
+
+combined_var_model <- combineVar(unlist(list_var_model))
+chosen.hvgs <- getTopHVGs(combined_var_model, n = 1000)
+
+```
+
+```{r}
+
+# Combine all SCE objects in the list into a single SCE
+sce_comb <- do.call(cbind, list_sce)
+
+```
+
+# Batch correction
+
+```{r}
+
+# Create a new batch variable with the library ID and the cell cycle to regress it
+sce_comb$library_cycle = paste0(sce_comb$SampleName, "_", sce_comb$cell_cycle_phase)
+
+fmnn.out <- suppressWarnings(batchelor::fastMNN( 
+  sce_comb,
+  batch = sce_comb$library_cycle,
+  subset.row = chosen.hvgs, # Correction perfromed on top 1000 hvg genes only
+  k = 300, # Number of nearest neighbors (higher the smoother the correction is)
+  d = 20) )# Number of dimension to retain
+
+#  Store the MNN Values in the reducedDim slot of the combined object
+reducedDim(sce_comb, "MNN.1-20") <- reducedDim(fmnn.out)
+
+```
+
+```{r Visualize FMNN loadings}
+
+# Export fmnn loadings
+fmnn_loadings = as_tibble(rowData(fmnn.out)$"rotation")
+rownames(fmnn_loadings) = rownames(fmnn.out)
+
+# Make atiblle out of fmnn loadings
+MNN_loadings_df = as_tibble(fmnn_loadings)
+colnames(MNN_loadings_df) = paste0("MNN", 1:ncol(fmnn_loadings))
+rownames(MNN_loadings_df) = rownames(fmnn_loadings)
+
+# Reshape from wide to long format
+MNN_loadings_df_long <- MNN_loadings_df %>%
+  mutate(gene = rownames(MNN_loadings_df)) %>%
+  tidyr::pivot_longer(cols = -gene, names_to = "MNNs", values_to = "Loading")
+
+# Calculate absolute values and arrange in descending order
+top_MNN_loadings <- MNN_loadings_df_long %>%
+  mutate(abs_loadings = abs(Loading)) %>%
+  group_by(MNNs) %>%
+  arrange(desc(abs_loadings)) %>%
+  slice_head(n = 20)   
+
+###################################
+### Plot 20 first MNNS loadings ####
+###################################
+
+plot_list = list()
+MNN_id = 1
+
+MNNs = paste0("MNN", 1:20)
+
+for(MNN in MNNs){
+  
+  top_MNN_loadings_subset = top_MNN_loadings %>%
+    dplyr::filter(MNNs == MNN) %>%
+    mutate(gene = factor(gene, levels = gene[order(abs_loadings, decreasing = F)]))  # Set factor levels based on decreasing order of loadings
+  
+  # Create a bar plot for top fmnn loadings, separated by principal components
+  plot = ggplot(top_MNN_loadings_subset, aes(x = Loading , y = gene)) +  # 'gene' should be the identifier for rows/features
+    geom_col() +
+    labs(title = paste0("Top 20 loadings for MNN", MNN_id),
+         x = "Absolute Loading",
+         y = "Gene") +
+    theme_minimal() 
+  
+  plot_list[[MNN_id]] = plot
+  MNN_id = MNN_id + 1
+  
+}
+
+
+multiple_page_layout <- gridExtra::marrangeGrob(
+  grobs = plot_list, 
+  nrow = 3, ncol = 3)
+
+ggsave(
+  plot = multiple_page_layout,
+  filename = paste0(out_path,time_stamp(),"plot_MNN_1-20_loadings.pdf"),
+  device = "pdf",
+  height = 12,
+  width = 10
+)
+
+```
+
+```{r Choosing MNNs according loadings }
+
+### Check how much the two first PCs are capturing sequencing depth (If ~1, then remove it)
+##########################################################################################
+
+MNN = reducedDim(sce_comb, "MNN.1-20")
+
+# Store depth as the sum of counts for each cell (2 = sum of rows)
+depth <- apply(counts(sce_comb), 2, sum)
+
+paste("Correlation between MNN1 and sequenging depth with the raw data is:", 
+      round(abs(cor(MNN[,1], depth)), digits = 2))
+
+paste("Correlation between MNN2 and sequenging depth with the raw data is:", 
+      round(abs(cor(MNN[,2], depth)), digits = 2))
+
+paste("Correlation between MNN3 and sequenging depth with the raw data is:", 
+      round(abs(cor(MNN[,3], depth)), digits = 2))
+
+paste("Correlation between MNN4 and sequenging depth with the raw data is:", 
+      round(abs(cor(MNN[,4], depth)), digits = 2))
+
+```
+
+# Uniform Manifold Approximation and Projection (UMAP) 
+
+```{r Run UMAP}
+
+sce_comb <- runUMAP(
+  sce_comb,
+  dimred = "MNN.1-20",
+  name = "UMAP_on_MNN.1-20",
+  n_neighbors = 300,
+  min_dist = 0.7)
+
+# Set default UMAP reduced dim slot
+reducedDim(sce_comb,"UMAP") = reducedDim(sce_comb,"UMAP_on_MNN.1-20")
+
+```
+
+# Visualization 
+
+```{r Make a tibble of metadata}
+
+# get metadata
+md <- as_tibble(colData(sce_comb))
+
+# get embeddings from 2 first PC
+coords <- as_tibble(reducedDim(sce_comb, "UMAP_on_MNN.1-20"))[,1:2]
+colnames(coords) = c("UMAP_1","UMAP_2")
+
+# combine dataframes
+md <- cbind(md, coords)
+
+```
+
+```{r Facetted UMAP colored per library}
+
+sample_id = 1
+plot_list = list()
+
+for (sample in unique(md$SampleGroup)) {
+  
+  md_other <- subset(md, SampleGroup != sample)
+  md_sample <- subset(md, SampleGroup == sample)
+  
+  plot <- ggplot() +
+    # Rasterise the first layer
+    ggrastr::rasterise(
+      geom_point(
+        data = md_other,
+        aes(x = UMAP_1, y = UMAP_2), 
+        fill = "grey", alpha = 0.4, size = 0.9,shape = 21, color = "gray10", stroke = 0.1
+      ), dpi = 200, scale = 0.5
+    ) +
+    # Rasterise the second layer
+    ggrastr::rasterise(
+      geom_point(
+        data = md_sample,
+        aes(x = UMAP_1, y = UMAP_2, fill = SampleGroup), 
+        alpha = 0.8, size = 1.5, shape = 21, color = "gray10", stroke = 0.2 
+      ), dpi = 200, scale = 0.6
+    ) +
+    ggtitle(label = sample,
+            subtitle = "Batch Correction (FastMNN applied)" ) +
+    theme_classic() +
+    guides(
+      fill = "none",
+      alpha = "none",
+      size = "none"
+    )
+  
+  plot_list[[sample_id]] = plot
+  
+  sample_id = sample_id + 1
+  
+}
+
+multiple_page_layout <- gridExtra::marrangeGrob(
+  grobs = plot_list, 
+  nrow = 2, ncol = 1)
+
+ggsave(
+  plot = multiple_page_layout,
+  filename = paste0(out_path,time_stamp(),"plots_UMAP_Facetted_Sample.pdf"),
+  device = "pdf",
+  width = 210,
+  height = 297,
+  unit = "mm")
+
+
+```
+
+```{r Facetted UMAP colored per cell cycle phase}
+
+sample_id = 1
+plot_list = list()
+
+for (cycle in unique(md$cell_cycle_phase)) {
+  
+  md_other <- subset(md, cell_cycle_phase != cycle)
+  md_sample <- subset(md, cell_cycle_phase == cycle)
+  
+  plot <- ggplot() +
+    # Rasterise the first layer
+    ggrastr::rasterise(
+      geom_point(
+        data = md_other,
+        aes(x = UMAP_1, y = UMAP_2), 
+        fill = "grey", alpha = 0.4, size = 0.9,shape = 21, color = "gray10", stroke = 0.1
+      ), dpi = 200, scale = 0.5
+    ) +
+    # Rasterise the second layer
+    ggrastr::rasterise(
+      geom_point(
+        data = md_sample,
+        aes(x = UMAP_1, y = UMAP_2, fill = cell_cycle_phase), 
+        alpha = 0.8, size = 1.5, shape = 21, color = "gray10", stroke = 0.2 
+      ), dpi = 200, scale = 0.6
+    ) +
+    ggtitle(label = cycle,
+            subtitle = "Batch Correction (FastMNN applied)" ) +
+    theme_classic() +
+    guides(
+      fill = "none",
+      alpha = "none",
+      size = "none"
+    )
+  
+  plot_list[[sample_id]] = plot
+  
+  sample_id = sample_id + 1
+  
+}
+
+multiple_page_layout <- gridExtra::marrangeGrob(
+  grobs = plot_list, 
+  nrow = 2, ncol = 1)
+
+ggsave(
+  plot = multiple_page_layout,
+  filename = paste0(out_path,time_stamp(),"plots_UMAP_Facetted_Cell_Cycle.pdf"),
+  device = "pdf",
+  width = 210,
+  height = 297,
+  unit = "mm")
+
+
+```
+
+```{r Single UMAP colored with cell cycle phase }
+
+plot <- ggplot() +
+  # Rasterise the first layer
+  ggrastr::rasterise(
+    geom_point(
+      data = md,
+      aes(x = UMAP_1, y = UMAP_2, fill = cell_cycle_phase), 
+      alpha = 0.7, size = 1.3, 
+      shape = 21,
+      color = "gray10",
+      stroke = 0.2),  # Lighter stroke color (adjust as needed)),# Ensure shape supports fill and color
+    dpi = 300, scale = 1) +
+  scale_fill_manual(values = pal_cell_cycle_phase) +
+  theme_classic() +
+  guides(
+    alpha = "none",
+    size = "none"
+  ) 
+
+ggsave(
+  plot = plot,
+  filename = paste0(out_path,time_stamp(),"plot_UMAP_Single_cell_cycle_phase.pdf"),
+  device = "pdf",
+  width = 10,
+  height = 8,
+)
+
+```
+
+```{r Single UMAP colored with SampleGroup }
+
+# Calculate centroids for each cluster
+centroids <- md %>%
+  group_by(SampleGroup) %>%
+  summarise(
+    UMAP_1 = mean(UMAP_1),
+    UMAP_2 = mean(UMAP_2),
+    .groups = 'drop'
+  )
+
+# Move the labels abo ve the cluster for each of them
+centroids$UMAP_2 = centroids$UMAP_2 + c(5,4,4,4.5,3,)
+
+plot <- ggplot() +
+  # Rasterise the first layer
+  ggrastr::rasterise(
+    geom_point(
+      data = md,
+      aes(x = UMAP_1, y = UMAP_2, fill = SampleGroup), 
+      alpha = 0.7, size = 1.3, 
+      shape = 21,
+      color = "gray10",
+      stroke = 0.2),  # Lighter stroke color (adjust as needed)),# Ensure shape supports fill and color
+    dpi = 300, scale = 1) +
+  scale_fill_manual(values = pal_PDO_Line) +
+  theme_classic() +
+  guides(
+    fill = "none",
+    alpha = "none",
+    size = "none"
+  ) +
+  # Add cluster numbers in the center of each cluster
+  geom_text(
+    data = centroids,
+    aes(x = UMAP_1, y = UMAP_2, label = SampleGroup),
+    color = "black",  # Color for the cluster numbers
+    size = 7,  # Adjust size as needed
+    fontface = "bold"
+  )
+
+ggsave(
+  plot = plot,
+  filename = paste0(out_path,time_stamp(),"plot_UMAP_Single_PDO_Line_ID.pdf"),
+  device = "pdf",
+  width = 10,
+  height = 8,
+)
+
+```
+
+

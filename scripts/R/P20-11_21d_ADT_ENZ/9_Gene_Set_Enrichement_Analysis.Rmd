@@ -1,0 +1,380 @@
+---
+title: "8.P20-11 ADT+ENZ treated (21 Days): Gene Set Enrichment Analysis"
+author: "Romuald Parmentier"
+date: "2025-04-09"
+output: html_document
+---
+
+```{r Prepare environment, message = F}
+
+# Libraries
+
+# Libraries
+library(SingleCellExperiment)
+library(muscat)
+library(dplyr)
+library(ggplot2)
+library(clusterProfiler)
+library(fgsea)
+library(org.Hs.eg.db)
+library(enrichplot)
+library(forcats)
+library(enrichplot)
+library(viridis)
+library(msigdbr)
+
+# Functions and palettes
+source("/scicore/home/wykopa75/GROUP/rparmentier/sc_RNAseq/my_R_functions/Xenograft_Models_Custom_Functions.R")
+source("/scicore/home/wykopa75/GROUP/rparmentier/sc_RNAseq/my_R_functions/Xenograft_Models_Color_Palettes.R")
+
+
+# Create output path
+out_path = create_exp_folder(
+  organ = "Prostate" ,
+  project = "Xenograft_Models",
+  samples_ID = "P20-11_21d_ADT_ENZ",
+  exp = "9_Gene_Set_Enrichment_Analysis"
+)
+
+set.seed(123)
+
+```
+
+```{r}
+
+file_path = get_exp_file_path(
+  organ = "Prostate" ,
+  project = "Xenograft_Models",
+  samples_ID = "P20-11_21d_ADT_ENZ",
+  prev_exp = "6_Dimension_Reduction",
+  pattern = "sce_obj_dim_reduced.rds")
+
+sce_obj = readRDS(file_path)
+
+# Load all DE files and store in a list
+
+file_path = get_exp_file_path(
+  organ = "Prostate",
+  project = "Xenograft_Models",
+  samples_ID = "P20-11_21d_ADT_ENZ",
+  prev_exp = "8_Differential_Expression",
+  pattern = "Effect.csv")
+
+Effets_DE_Genes_List = lapply(file_path, function(x){read.csv2(x)})
+
+names(Effets_DE_Genes_List) = c("ADT_Effect", "Enzalutamide_ADT_Effect", "Enzalutamide_Effect")
+
+# Comparison list
+
+comparison_list = list(
+  "ADT_Effect" = c("DHT_noENZ","noDHT_noENZA"),
+  "Enzalutamide_Effect" = c("DHT_noENZ","DHT_ENZA"),
+  "Enzalutamide_ADT_Effect"= c("noDHT_noENZA","noDHT_ENZA")
+)
+
+```
+
+# Gene set enrichment analysis
+
+```{r Compute score with pval anf logFC to sort list of genes}
+
+# Score genes
+#############
+
+Gene_FC_scored_list = list()
+
+for(effect_id in seq_along(Effets_DE_Genes_List)){
+  
+  effect_name = names(Effets_DE_Genes_List)[[effect_id]]
+  effect_deg = Effets_DE_Genes_List[[effect_id]]
+  
+  effect_deg_scored = effect_deg %>%
+    mutate(score = (-log10(pmax(p_val_adj, 1e-300)) * avg_log2FC)) %>%
+    arrange(desc(score)) 
+  
+  Gene_FC_sorted = as.vector(effect_deg_scored$score)
+  names(Gene_FC_sorted) = effect_deg_scored$gene
+  
+  Gene_FC_scored_list[[effect_name]] = Gene_FC_sorted
+  
+}
+
+```
+
+```{r Load Gene Sets collections}
+
+# Load collections
+HALLMARK <- read.gmt("/scicore/home/wykopa75/GROUP/rparmentier/sc_RNAseq/Projects/Sequencing_Data/Gene_sets/MSigDB_HALLMARKS_hs_v2023_2.gmt")
+GOBP <- read.gmt("/scicore/home/wykopa75/GROUP/rparmentier/sc_RNAseq/Projects/Sequencing_Data/Gene_sets/MSigDB_C5_GO_Biological_Process.gmt")
+GOMF <- read.gmt("/scicore/home/wykopa75/GROUP/rparmentier/sc_RNAseq/Projects/Sequencing_Data/Gene_sets/MSigDB_C5_GO_Molecular_Function.gmt")
+C2 = read.gmt("/scicore/home/wykopa75/GROUP/rparmentier/sc_RNAseq/Projects/Sequencing_Data/Gene_sets/MSigDB_C2_Curated_Gensets.gmt")
+
+TRRUST = read.csv(
+  file = "/scicore/home/wykopa75/GROUP/rparmentier/sc_RNAseq/Projects/Sequencing_Data/Gene_sets/TRRUST_DB_AR_targets_human.tsv",
+  sep = "\t")
+
+TRRUST <- TRRUST %>%
+  dplyr::select(Type, Target) %>%
+  rename(term = Type, gene = Target) %>%
+  transmute(term = paste0("TRRUST_", term),gene )
+
+TRRUST <- TRRUST %>%
+  filter(term %in% c("TRRUST_Unknown", "TRRUST_Activation")) %>%
+  mutate(term = "TRRUST_Unknown_&_Activation") %>%
+  bind_rows(TRRUST)
+
+TRRUST <- TRRUST %>%
+  filter(term %in% c("TRRUST_Unknown", "TRRUST_Repression")) %>%
+  mutate(term = "TRRUST_Unknown_&_Repression") %>%
+  bind_rows(TRRUST)
+
+
+list_collection <- list(
+  "C2" = C2,
+  "HALLMARK" = HALLMARK,
+  "GOBP" = GOBP,
+  "GOMF" = GOMF,
+  "TRRUST" = TRRUST
+)
+
+names_collection = names(list_collection)
+
+```
+
+```{r Perform GSEA}
+
+gse_per_collection_list = list()
+gse_per_collection_df_list = list()
+
+for(effect_id in seq_along(Gene_FC_scored_list)){
+  
+  effect_name = names(Gene_FC_scored_list)[effect_id]
+  Gene_FC_sorted = Gene_FC_scored_list[[effect_name]]
+  
+  gse_df_list = list()
+  gse_per_collection = list()
+  
+  # Perform GSEA for each collection
+  for(collection_id in seq_along(list_collection)){
+    
+    collection <- list_collection[[collection_id]]
+    collection_name <- names_collection[collection_id]
+    
+    print(paste0(effect_name))
+    print(paste0("Performing GSEA for collection: ", collection_name))
+    
+    gse <- clusterProfiler::GSEA(
+      geneList = Gene_FC_sorted,
+      TERM2GENE = collection,
+      pvalueCutoff = 0.05,
+      pAdjustMethod = "fdr",
+      minGSSize = 10, # #3
+      maxGSSize = 100, #60
+      by = "fgsea",
+      $verbose = FALSE
+    )
+    
+    if (nrow(gse@result) == 0) {
+      print(paste0("No enriched terms found for collection: ", collection_name))
+      collection_id = collection_id + 1
+      next
+    }
+    
+    print(paste0(nrow(gse@result), " enriched terms found in collection: ", collection_name))
+    
+    # Store results
+    gse_df <- gse@result
+    gse_df$Collection <- collection_name
+    gse_df_list <- append(gse_df_list, list(gse_df))
+    gse_per_collection <- append(gse_per_collection, list(gse))
+    
+    collection_id = collection_id + 1
+    
+  }
+  
+  # Make a single dataframe out of gsea results
+  names(gse_per_collection) = lapply(gse_df_list,function(x){unique(x$Collection)})
+  gse_per_collection_df = data.table::rbindlist(gse_df_list)
+  
+  # Export gse object
+  
+  saveRDS(
+    object = gse_per_collection,
+    file = paste0(output_path, time_stamp(),"gse_objects_per_collection_", effect_name ,".rds")
+  )
+  
+  saveRDS(
+    object = gse_per_collection_df,
+    file = paste0(output_path, time_stamp(),"gse_results_per_collection_", effect_name ,".csv")
+  )
+  
+  gse_per_collection_list[[effect_name]] = gse_per_collection
+  gse_per_collection_df_list[[effect_name]] = gse_per_collection_df
+  
+}
+
+```
+
+```{r GSEA dotplot}
+
+# Create output dir if not existing
+###################################
+
+GSEA_dotplot_path = paste0(out_path,"/Gene_Set_Enrichment_Analysis/GSEA_Dotplots/")
+
+# Create dir if not existing
+if (!dir.exists(GSEA_dotplot_path)) {
+  dir.create(GSEA_dotplot_path, recursive = TRUE)
+}
+
+# Make plots
+#############
+
+for (effect_id in seq_along(gse_per_collection_list)){
+  
+  effect_name = names(gse_per_collection_list)[[effect_id]]
+  gse_per_collection = gse_per_collection_list[[effect_name]]
+  
+  for (collection_id in seq_along(gse_per_collection)) {
+    
+    collection_name <- names(gse_per_collection)[collection_id]
+    gse = gse_per_collection[[collection_name]]
+    
+    print(paste0("Generating plot for collection: ", collection_name))
+    
+    # using .sign assigns positiv NES score as "activated" 
+    # Positive NES is led by genes enriched at the top of the ranked list 
+    # Those have a positive score, as it is the product of the sign of avg_log2FC in line 190) 
+    plot <- dotplot(
+      gse,
+      split = ".sign") +
+      facet_grid(. ~ .sign) +
+      ggtitle(
+        label = paste0(collection_name, ": " , effect_name," | Reference = ", comparison_list[[effect_name]][1] )) +
+      theme(axis.text.y = element_text(size = 8))
+    
+    # Save the plot
+    ggsave(
+      plot = plot,
+      filename = paste0(GSEA_dotplot_path, "/", time_stamp(), "Dotplot_", effect_name,"_", collection_name,".pdf"),
+      device = "pdf",
+      width = 9,
+      height = 6
+    )
+    
+  }
+  
+}
+
+```
+
+```{r GSEA Enrichment score plot (on single enriched Patways)}
+
+# Create output dir if not existing
+###################################
+
+GSEA_plot_path = paste0(out_path,"Gene_Set_Enrichment_Analysis/GSEA_Enrichment_plots/")
+
+# Create dir if not existing
+if (!dir.exists(GSEA_plot_path)) {
+  dir.create(GSEA_plot_path, recursive = TRUE)
+}
+
+# Make plots
+
+for(effect_id in seq_along(gse_per_collection_list)){
+  
+  effect_name = names(gse_per_collection_df_list)[[effect_id]]
+  gse_per_collection = gse_per_collection_list[[effect_name]]
+  gse_per_collection_df = gse_per_collection_df_list[[effect_name]]
+  
+  # Loop through each unique pathway
+  for (pathway in unique(gse_per_collection_df$ID)) {
+    
+    # Extract collection name
+    collection_name = sub(x = pathway, pattern = "_.*", replacement =  "")
+    
+    # Load the GSEA object corresponding to the collection
+    pathway_gse = gse_per_collection[[collection_name]]
+    
+    if(!is.null(pathway_gse)){
+      
+      # Plot enrichment for significant pathways
+      plot_enrich = enrichplot::gseaplot2(
+        x = pathway_gse,
+        geneSetID = pathway,
+        pvalue_table = TRUE,
+        title = paste0(effect_name, ": ", pathway)
+      )
+      
+      # Save the enrichment plot
+      ggsave(
+        plot = plot_enrich,
+        filename = paste0(GSEA_plot_path, time_stamp(), "Enrichment_plot_", effect_name, "_", pathway, ".pdf"),
+        device = "pdf",
+        width = 13,
+        height = 9
+      )
+      
+      
+    }
+    
+    if (is.null(pathway_gse)) next
+    
+  }
+  
+}
+
+```
+
+### Targeted GSEA
+
+```{r Retrieve specific gene_sets for testing}
+
+panels = c(
+  "C2" = "LIU_PROSTATE_CANCER_UP",
+  "C2" = "LIU_PROSTATE_CANCER_DN",
+  "C2" = "TOMLINS_PROSTATE_CANCER_UP",
+  "C2" = "TOMLINS_PROSTATE_CANCER_DN",
+  "C2" = "WALLACE_PROSTATE_CANCER_UP",
+  "C2" = "WALLACE_PROSTATE_CANCER_DN",
+  "H" = "HALLMARK_ANDROGEN_RESPONSE",
+  "H" = "HALLMARK_MYC_TARGETS_V1",
+  "H" = "HALLMARK_MITOTIC_SPINDLE",
+  "H" = "HALLMARK_E2F_TARGETS",
+  "H" = "HALLMARK_G2M_CHECKPOINT",
+  "C5" = "GOBP_KERATINOCYTE_DIFFERENTIATION"
+)
+
+
+gene_panel = get_signature_data(
+  pathway_proxy = "HALLMARK_ANDROGEN_RESPONSE",
+  MSigDB_category = "H")
+
+gene_panel = gene_panel[,c("NAME","SYMBOL")]
+colnames(gene_panel) = c("term","gene")
+
+```
+
+```{r Perform and visualize GSEA with ClusterProfiler}
+
+  gse <- clusterProfiler::GSEA(
+      geneList = Gene_FC_scored_list$`P20-11`,
+      TERM2GENE = gene_panel,
+      pvalueCutoff = Inf,
+      pAdjustMethod = "fdr",
+      minGSSize = 25, # #3
+      maxGSSize = 300, #60
+      by = "fgsea",
+      verbose = FALSE
+    )
+
+  # Visualize GSEAt
+  plot = gseaplot2(gse,
+                   geneSetID = 1,
+                   pvalue_table = T)
+  
+  print(plot)
+
+
+```

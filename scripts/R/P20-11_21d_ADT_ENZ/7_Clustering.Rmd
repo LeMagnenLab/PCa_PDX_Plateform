@@ -1,0 +1,279 @@
+---
+title: "7. P20-11 ADT+ENZ treated (21 Days): clustering"
+author: "Romuald Parmentier"
+date: "2025-06-06"
+output: html_document
+---
+
+```{r Prepare environment, message = F}
+
+# Libraries
+library(SingleCellExperiment)
+library(dplyr)
+library(scran)
+library(scater)
+library(dplyr)
+
+# Functions and palettes
+source("/scicore/home/wykopa75/GROUP/rparmentier/sc_RNAseq/Projects/Prostate/Xenograft_Models/Xenograft_Models_Custom_Functions.R")
+source("/scicore/home/wykopa75/GROUP/rparmentier/sc_RNAseq/Projects/Prostate/Xenograft_Models/Xenograft_Models_Color_Palettes.R")
+
+# Create output path (adapted)
+out_path = create_exp_folder(
+  organ = "Prostate",
+  project = "Xenograft_Models",
+  samples_ID = "P20-11_21d_ADT_ENZ",
+  exp = "7_Clustering"
+)
+
+```
+
+# Prepare the data
+
+```{r Load the files}
+
+file_path = get_exp_file_path(
+  organ = "Prostate",
+  project = "Xenograft_Models",
+  samples_ID = "P20-11_21d_ADT_ENZ",
+  prev_exp = "6_Dimension_Reduction",  
+  pattern = "sce_obj_dim_reduced.rds")
+
+sce_obj = readRDS(file_path)
+
+```
+
+# Clustering with Walktrap
+
+```{r walktrap clustering with different K}
+
+k_ids = c(15, 25, 50, 75)
+
+# For loop to calculate clustering information assignation
+for(k_id in k_ids) {
+  
+  print(paste("Clustering with k =", k_id, "ongoing"))
+  
+  clustering = clusterCells(
+    sce_obj,
+    use.dimred = "UMAP_on_PCA.1-20",
+    BLUSPARAM = bluster::SNNGraphParam(
+      k = k_id,
+      type = "rank",
+      cluster.fun = "walktrap")
+  )
+  
+  # Create a column in colData with the type of clustering and the associated parameter
+  sce_obj[[paste0("walktrap_", k_id)]] = clustering
+  
+}
+
+```
+```{r Export sce object with clustering groups}
+
+saveRDS(object = sce_obj,
+        file = paste0(out_path,time_stamp(),"sce_obj_clustered.rds"))
+
+```
+
+
+# Visualize clustering
+
+```{r Make a tibble of metadata}
+
+# get metadata
+md <- as_tibble(colData(sce_obj))
+
+# get embeddings from 2 first PC
+coords <- as_tibble(reducedDim(sce_obj, "UMAP_on_PCA.1-20"))[,1:2]
+colnames(coords) = c("UMAP_1","UMAP_2")
+
+# combine dataframes
+md <- cbind(md, coords)
+
+```
+
+```{r Facette UMAP colord with cluster number according walktrap k values}
+
+k_ids = c(15, 25, 50, 75)  # Define clustering IDs
+plot_id = 1            # Initialize plot ID counter
+plot_list = list()     # Initialize empty list to store plots
+
+for(k_id in k_ids) {
+  
+  clustering = paste0("walktrap_", k_id)  # Construct the clustering column name
+  
+  # Create ggplot with rasterized points for each clustering
+  plot <- ggplot() +
+    # Rasterize the geom_point layer
+    ggrastr::rasterise(
+      geom_point(
+        data = md,  # DataFrame containing UMAP coordinates and clustering info
+        aes(x = UMAP_1, y = UMAP_2, fill = .data[[clustering]]),  # Use the dynamic clustering column
+        alpha = 0.7, size = 1.3, 
+        shape = 21, color = "gray10", stroke = 0.2  # Lighter stroke color
+      ), 
+      dpi = 300, scale = 1  # Higher DPI and scale for better resolution
+    ) +
+    scale_fill_manual(values = pal_walktrap_cluster) +  # Use predefined color palette
+    theme_classic() +  # Clean background
+    guides(
+      alpha = "none", 
+      size = "none"
+    ) +
+    ggtitle(label = "Dolgos 2024 Early Passage PDO: Walktrap clustering",
+            subtitle = paste0("Clustering param: NN = ", k_id)  # Dynamic subtitle
+    )
+  
+  plot_list[[plot_id]] = plot  # Add the plot to the list
+  plot_id = plot_id + 1        # Increment plot ID
+}
+
+# Arrange plots in a multi-page layout (2 plots per page)
+multiple_page_layout <- gridExtra::marrangeGrob(
+  grobs = plot_list,
+  nrow = 2, ncol = 1  # Define layout (2 rows, 1 column per page)
+)
+
+# Save the arranged plots to a multi-page PDF
+ggsave(
+  plot = multiple_page_layout,
+  filename = paste0(out_path,time_stamp(),"plots_UMAP_Facetted_walktrap_clustering_15-75.pdf"),
+  device = "pdf",
+  width = 210, height = 297, units = "mm"
+)
+
+```
+
+```{r Single UMAP colored with clustering of choice}
+
+# Calculate centroids for each cluster
+centroids <- md %>%
+  group_by(walktrap_75) %>%
+  summarise(
+    UMAP_1 = mean(UMAP_1),
+    UMAP_2 = mean(UMAP_2),
+    .groups = 'drop'
+  )
+
+plot <- ggplot() +
+  # Rasterise the first layer
+  ggrastr::rasterise(
+    geom_point(
+      data = md,
+      aes(x = UMAP_1, y = UMAP_2, fill = walktrap_75), 
+      alpha = 0.7, size = 1.3, 
+      shape = 21,
+      color = "gray10",
+      stroke = 0.2),  # Lighter stroke color (adjust as needed)),# Ensure shape supports fill and color
+    dpi = 300, scale = 1) +
+  scale_fill_manual(values = pal_walktrap_cluster) +
+  theme_classic() +
+  guides(
+    fill = "none",
+    alpha = "none",
+    size = "none"
+  ) +
+  # Add cluster numbers in the center of each cluster
+  geom_text(
+    data = centroids,
+    aes(x = UMAP_1, y = UMAP_2, label = walktrap_75),
+    color = "black",  # Color for the cluster numbers
+    size = 7,  # Adjust size as needed
+    fontface = "bold"
+  )
+
+ggsave(
+  plot = plot,
+  filename = paste0(out_path,time_stamp(),"plot_UMAP_Single_walktrap_75.pdf"),
+  device = "pdf",
+  width = 10,
+  height = 8,
+)
+
+```
+
+```{r}
+
+# Calculate centroids for each cluster
+centroids <- md %>%
+  group_by(walktrap_75) %>%
+  summarise(
+    UMAP_1 = mean(UMAP_1),
+    UMAP_2 = mean(UMAP_2),
+    .groups = 'drop'
+  )
+
+plot <- ggplot() +
+  # Rasterise the first layer
+  ggrastr::rasterise(
+    geom_point(
+      data = md,
+      aes(x = UMAP_1, y = UMAP_2, fill = walktrap_75), 
+      alpha = 0.7, size = 1.8, 
+      shape = 21,
+      color = "gray10",
+      stroke = 0.2),  # Lighter stroke color (adjust as needed)),# Ensure shape supports fill and color
+    dpi = 300, scale = 1) +
+  scale_fill_manual(values = pal_walktrap_cluster) +
+  theme_classic() +
+  guides(
+    fill = "none",
+    alpha = "none",
+    size = "none"
+  ) 
+
+#   # Add cluster numbers in the center of each cluster
+#   geom_text(
+#     data = centroids,
+#     aes(x = UMAP_1, y = UMAP_2, label = walktrap_75),
+#     color = "black",  # Color for the cluster numbers
+#     size = 7,  # Adjust size as needed
+#     fontface = "bold"
+#   )
+
+ggsave(
+  plot = plot,
+  filename = paste0(out_path,time_stamp(),"plot_UMAP_Single_walktrap_75.pdf"),
+  device = "pdf",
+  width = 6,
+  height = 6,
+)
+
+
+```
+
+## Proportion of cells
+
+# Treatment against clustering
+
+```{r Proportion of cells in clusters against treatment}
+
+metadata_df = as_data_frame(colData(sce_obj))
+
+stat <- metadata_df %>% 
+  group_by(Multiplexing_Condition, walktrap_75) %>% 
+  summarise(count = n()) 
+
+data <- stat %>%
+  group_by(walktrap_75) %>%
+  mutate(Percentage = count / sum(count) * 100) %>%
+  ungroup()
+
+plot = ggplot(data, aes(x = Percentage, y = walktrap_75, fill = Multiplexing_Condition)) +
+  geom_bar(stat = "identity", position = "stack") +
+  scale_fill_manual(values = pal.treatment) +
+  scale_x_continuous(labels = scales::percent_format(scale = 1)) +
+  labs(x = "Percentage of Cells", y = "Cluster") +
+  ggtitle(label = sprintf("Proportion of cells of each treatment per cluster"))+
+  theme_minimal()
+
+ggsave(
+  plot = plot,
+  filename = paste0(out_path,time_stamp(),"plot_Proportion_Treatment_vs_Clustering", ".pdf"),
+  device = "pdf",
+  width = 8,
+  height = 4
+)
+
+```
