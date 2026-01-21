@@ -1,0 +1,52 @@
+---
+title: "Labrecque_Bulk_RNAseq_analysis"
+format:
+  html:
+    embed-resources: true
+    toc: true
+    toc-location: left
+    smooth-scroll: true
+    toc-depth: 2 # Only displays two levels of title hierrachy
+    code-tools: true # Display source code button in the top right corner
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+::: {.callout-note}
+**Goal**: 
+:::
+
+```{r}
+#| label: libraries and directories
+#| code-summary: "Code block: libraries and directories"
+#| echo: false
+
+library(tidyverse)
+library(here)
+
+data_path = here("data","GSE126078_RAW")
+output_path = here("outputs","Labrecque_2019") 
+
+```
+
+```{r}
+#| label: load data
+#| code-summary: "Code block: libraries and directories"
+#| echo: false
+
+test = data.table::fread(list.files(data_path, full.names = T)[1])
+list_count_matrices = list.files(data_path)
+
+```
+
+
+```{r}
+#| label: clean WES pipeline output
+#| code-summary: "Code block: clean WES pipeline output"
+#| echo: true
+#| code-fold: true
+
+```
+
